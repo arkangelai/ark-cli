@@ -1,0 +1,1772 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ARK_VERSION="0.3.3"
+ARK_CONFIG_FILE="${HOME}/.config/ark/config"
+ARK_DEFAULT_API_URL="http://localhost:3000"
+ARK_DEFAULT_LIMIT="20"
+HUMAN_OUTPUT="${HUMAN_OUTPUT:-false}"
+DRY_RUN=false
+KNOWN_TASK_FIELDS="id title description status priority task_type context deadline_at log_path confidence_score version created_by created_by_type created_at updated_at"
+
+# ─── Dependencies ──────────────────────────────────────────────────────────────
+check_deps() {
+  local missing=()
+  for cmd in curl jq; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    local hint
+    if [[ "$(uname)" == "Darwin" ]]; then
+      hint="brew install ${missing[*]}"
+    else
+      hint="sudo apt-get install -y ${missing[*]}"
+    fi
+    printf '{"ok":false,"cli_version":"%s","error":{"code":"missing_dependency","message":"Required: %s","retryable":false,"detail":{}},"suggestion":"%s"}\n' \
+      "$ARK_VERSION" "${missing[*]}" "$hint" >&2
+    exit 1
+  fi
+}
+
+# ─── UUID ──────────────────────────────────────────────────────────────────────
+gen_uuid() {
+  if command -v uuidgen &>/dev/null; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -f /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
+
+# ─── Config ────────────────────────────────────────────────────────────────────
+config_get() {
+  [[ -f "$ARK_CONFIG_FILE" ]] && grep "^${1}=" "$ARK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+config_set() {
+  mkdir -p "$(dirname "$ARK_CONFIG_FILE")"
+  touch "$ARK_CONFIG_FILE" && chmod 600 "$ARK_CONFIG_FILE"
+  local tmp; tmp=$(mktemp)
+  grep -v "^${1}=" "$ARK_CONFIG_FILE" > "$tmp" 2>/dev/null || true
+  echo "${1}=${2}" >> "$tmp"
+  mv "$tmp" "$ARK_CONFIG_FILE" && chmod 600 "$ARK_CONFIG_FILE"
+}
+
+config_del() {
+  if [[ -f "$ARK_CONFIG_FILE" ]]; then
+    local tmp; tmp=$(mktemp)
+    grep -v "^${1}=" "$ARK_CONFIG_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$ARK_CONFIG_FILE" && chmod 600 "$ARK_CONFIG_FILE"
+  fi
+}
+
+# ─── API key + URL ─────────────────────────────────────────────────────────────
+resolve_api_key() {
+  local k
+  k=$(config_get "api-key")
+  if [[ -z "$k" ]]; then
+    err_json "unauthenticated" "No API key configured. Run: ark config set api-key <your-key>" "false" "{}" "ark config set api-key <your-key>"
+    exit 3
+  fi
+  echo "$k"
+}
+
+resolve_api_url() {
+  if [[ -n "${ARK_API_URL:-}" ]]; then
+    echo "$ARK_API_URL"
+  else
+    local stored; stored=$(config_get "url")
+    echo "${stored:-$ARK_DEFAULT_API_URL}"
+  fi
+}
+
+# ─── Error output ──────────────────────────────────────────────────────────────
+err_json() {
+  local code="$1" msg="$2" retryable="$3" detail="${4}" suggestion="${5:-}"
+  [[ -z "$detail" ]] && detail="{}"
+  jq -n \
+    --arg v "$ARK_VERSION" --arg code "$code" --arg msg "$msg" \
+    --argjson retryable "$retryable" --argjson detail "$detail" \
+    --arg suggestion "$suggestion" \
+    '{ok:false,cli_version:$v,error:{code:$code,message:$msg,retryable:$retryable,detail:$detail},suggestion:$suggestion}' >&2
+}
+
+# ─── HTTP ──────────────────────────────────────────────────────────────────────
+HTTP_STATUS="" HTTP_BODY="" HTTP_REQUEST_ID="" HTTP_IDEMPOTENT_REPLAY="false"
+
+http_request() {
+  local method="$1" path="$2" body="${3:-}" idem_key="${4:-}"
+  local token; token=$(resolve_api_key)
+  local url; url="$(resolve_api_url)${path}"
+  local body_file header_file
+  body_file=$(mktemp); header_file=$(mktemp)
+
+  local args=(
+    --silent --write-out "%{http_code}"
+    --output "$body_file" --dump-header "$header_file"
+    -X "$method"
+    -H "Authorization: Bearer ${token}"
+    -H "Content-Type: application/json"
+  )
+  [[ -n "$idem_key" ]] && args+=(-H "Idempotency-Key: ${idem_key}")
+  [[ -n "$body" ]] && args+=(--data "$body")
+
+  [[ "${ARK_DEBUG:-0}" -ge 2 ]] && echo "[DEBUG] ${method} ${url}${body:+ body=${body}}" >&2
+
+  local exit_code=0
+  set +e
+  HTTP_STATUS=$(curl "${args[@]}" "$url")
+  exit_code=$?
+  set -e
+
+  HTTP_BODY=$(cat "$body_file")
+  HTTP_REQUEST_ID=$(grep -i '^x-request-id:' "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}' || true)
+  local replay; replay=$(grep -i '^x-idempotent-replay:' "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}' | tr '[:upper:]' '[:lower:]' || true)
+  HTTP_IDEMPOTENT_REPLAY="${replay:-false}"
+  [[ "$HTTP_IDEMPOTENT_REPLAY" == "true" ]] || HTTP_IDEMPOTENT_REPLAY="false"
+
+  rm -f "$body_file" "$header_file"
+
+  [[ "${ARK_DEBUG:-0}" -ge 1 ]] && echo "[DEBUG] status=${HTTP_STATUS} body=${HTTP_BODY}" >&2
+
+  if [[ $exit_code -ne 0 ]]; then
+    err_json "network_error" "curl failed (exit ${exit_code}): ${url}" "true" "{}" ""
+    exit 1
+  fi
+}
+
+# ─── Response builder ──────────────────────────────────────────────────────────
+ok_response() {
+  local _empty_obj="{}"
+  local data="$1" links="${2:-$_empty_obj}" cmds="${3:-$_empty_obj}" meta="${4:-}"
+  local replay="${HTTP_IDEMPOTENT_REPLAY:-false}"
+  local rid="${HTTP_REQUEST_ID:-}"
+  local base
+  base=$(printf '%s' "$data" | jq -n \
+    --arg v "$ARK_VERSION" \
+    --argjson links "$links" --argjson cmds "$cmds" \
+    --argjson replay "$replay" --arg rid "$rid" \
+    'input as $data | {ok:true,cli_version:$v,data:$data,"_links":$links,next_commands:$cmds,idempotent_replay:$replay,request_id:$rid}')
+  [[ -n "$meta" ]] && base=$(printf '%s' "$base" | jq --argjson m "$meta" '. + {meta:$m}')
+  echo "$base"
+}
+
+# ─── HTTP error handler ────────────────────────────────────────────────────────
+handle_http_error() {
+  local status="$1" body="$2"
+  local code msg detail retryable suggestion exit_code
+
+  if printf '%s' "$body" | jq -e '.error' &>/dev/null 2>&1; then
+    code=$(printf '%s' "$body" | jq -r '.error.code // "unknown_error"')
+    msg=$(printf '%s' "$body" | jq -r '.error.message // "Unknown error"')
+    detail=$(printf '%s' "$body" | jq -c '.error.detail // {}')
+  else
+    code="unknown_error"; msg="HTTP ${status}"; detail="{}"
+  fi
+
+  case "$status" in
+    401|403) retryable="false"; exit_code=3; suggestion="Run: ark config set api-key <your-key>" ;;
+    404)     retryable="false"; exit_code=4; suggestion="" ;;
+    409|422) retryable="false"; exit_code=5
+      if [[ "$code" == "invalid_status_transition" ]]; then
+        local allowed; allowed=$(printf '%s' "$body" | jq -r '.error.detail.allowed // [] | join(", ")')
+        suggestion="Allowed transitions: ${allowed}"
+      else
+        suggestion=""
+      fi ;;
+    429) retryable="true"; exit_code=29; suggestion="Set ARK_IDEMPOTENCY_KEY and retry after delay" ;;
+    *)   retryable="true"; exit_code=1; suggestion="" ;;
+  esac
+
+  jq -n \
+    --arg v "$ARK_VERSION" --arg code "$code" --arg msg "$msg" \
+    --argjson retryable "$retryable" --argjson detail "$detail" \
+    --arg suggestion "$suggestion" --arg rid "${HTTP_REQUEST_ID:-}" \
+    '{ok:false,cli_version:$v,error:{code:$code,message:$msg,retryable:$retryable,detail:$detail},suggestion:$suggestion,request_id:$rid}' >&2
+  exit "$exit_code"
+}
+
+check_status() {
+  [[ "$HTTP_STATUS" == "$1" || "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+}
+
+# ─── HTTP multipart (uploads) ──────────────────────────────────────────────────
+# Usage: http_upload METHOD PATH IDEM_KEY -- -F field=value -F file=@path ...
+# Curl sets Content-Type: multipart/form-data with the boundary itself.
+http_upload() {
+  local method="$1" path="$2" idem_key="${3:-}"; shift 3
+  local token; token=$(resolve_api_key)
+  local url; url="$(resolve_api_url)${path}"
+  local body_file header_file
+  body_file=$(mktemp); header_file=$(mktemp)
+
+  local args=(
+    --silent --write-out "%{http_code}"
+    --output "$body_file" --dump-header "$header_file"
+    -X "$method"
+    -H "Authorization: Bearer ${token}"
+  )
+  [[ -n "$idem_key" ]] && args+=(-H "Idempotency-Key: ${idem_key}")
+  while [[ $# -gt 0 ]]; do args+=(-F "$1"); shift; done
+
+  [[ "${ARK_DEBUG:-0}" -ge 2 ]] && echo "[DEBUG] ${method} ${url} (multipart)" >&2
+
+  local exit_code=0
+  set +e
+  HTTP_STATUS=$(curl "${args[@]}" "$url")
+  exit_code=$?
+  set -e
+
+  HTTP_BODY=$(cat "$body_file")
+  HTTP_REQUEST_ID=$(grep -i '^x-request-id:' "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}' || true)
+  local replay; replay=$(grep -i '^x-idempotent-replay:' "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}' | tr '[:upper:]' '[:lower:]' || true)
+  HTTP_IDEMPOTENT_REPLAY="${replay:-false}"
+  [[ "$HTTP_IDEMPOTENT_REPLAY" == "true" ]] || HTTP_IDEMPOTENT_REPLAY="false"
+
+  rm -f "$body_file" "$header_file"
+
+  [[ "${ARK_DEBUG:-0}" -ge 1 ]] && echo "[DEBUG] status=${HTTP_STATUS} body=${HTTP_BODY}" >&2
+
+  if [[ $exit_code -ne 0 ]]; then
+    err_json "network_error" "curl failed (exit ${exit_code}): ${url}" "true" "{}" ""
+    exit 1
+  fi
+}
+
+# ─── upload helpers ────────────────────────────────────────────────────────────
+ARK_MAX_UPLOAD_BYTES=$((50 * 1024 * 1024))
+
+file_size_bytes() {
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
+}
+
+abs_path() {
+  local p="$1"
+  if [[ "$p" == /* ]]; then echo "$p"
+  else echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+  fi
+}
+
+# ─── next_commands builder ─────────────────────────────────────────────────────
+next_cmds() {
+  local id="$1" links="$2"
+  local out="{}"
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    local cmd
+    case "$key" in
+      claim)           cmd="ark tasks claim ${id}" ;;
+      complete)        cmd="ark tasks complete ${id} --confidence <0.0-1.0>" ;;
+      block)           cmd="ark tasks block ${id} --reason \"<reason>\"" ;;
+      set_workspace)   cmd="ark tasks update ${id} --log-path \"<storage-path>\"" ;;
+      add_output)      cmd="ark tasks outputs submit ${id} --type <type> --label <label>" ;;
+      upload_output)   cmd="ark tasks outputs upload ${id} <file-path> --type <type> --label <label>" ;;
+      upload_input)    cmd="ark tasks inputs upload ${id} <file-path>" ;;
+      document_url)    cmd="ark tasks documents url ${id} <input|output> <record-id>" ;;
+      post_note)       cmd="ark tasks comments post ${id} --type note --body \"<body>\"" ;;
+      register_input)  cmd="ark tasks inputs add ${id} --path \"<path>\"" ;;
+      approve)         cmd="ark tasks status ${id} --status done" ;;
+      request_changes) cmd="ark tasks status ${id} --status queued --comment-id <comment-id>" ;;
+      queue|requeue)   cmd="ark tasks status ${id} --status queued" ;;
+      cancel)          cmd="ark tasks status ${id} --status cancelled" ;;
+      archive)         cmd="ark tasks status ${id} --status archived" ;;
+      comment)         cmd="ark tasks comments post ${id} --type comment --body \"<body>\"" ;;
+      self)            cmd="ark tasks get ${id}" ;;
+      *)               cmd="ark tasks get ${id}" ;;
+    esac
+    out=$(printf '%s' "$out" | jq --arg k "$key" --arg v "$cmd" '. + {($k): $v}')
+  done < <(printf '%s' "$links" | jq -r 'keys[]' 2>/dev/null || true)
+  echo "$out"
+}
+
+# ─── dry-run helper ────────────────────────────────────────────────────────────
+dry_run_response() {
+  local method="$1" path="$2" body="${3:-}"
+  printf '%s' "${body:-null}" | jq -n --arg v "$ARK_VERSION" --arg m "$method" --arg p "$path" \
+    'input as $body | {ok:true,cli_version:$v,dry_run:true,data:{would_send:{method:$m,path:$p,body:$body}}}'
+}
+
+# ─── auth ──────────────────────────────────────────────────────────────────────
+cmd_auth() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    status)
+      local key; key=$(config_get "api-key") || true
+      if [[ -z "$key" ]]; then
+        jq -n --arg v "$ARK_VERSION" '{ok:true,cli_version:$v,data:{authenticated:false,api_key:null}}'
+        return
+      fi
+
+      local masked="${key:0:4}***"
+      local api_url; api_url=$(resolve_api_url)
+      local resp_file header_file; resp_file=$(mktemp); header_file=$(mktemp)
+      local http_status curl_exit=0
+
+      set +e
+      http_status=$(curl --silent --write-out "%{http_code}" \
+        --output "$resp_file" --dump-header "$header_file" \
+        -H "Authorization: Bearer ${key}" \
+        "${api_url}/api/tasks?limit=1")
+      curl_exit=$?
+      set -e
+
+      rm -f "$resp_file" "$header_file"
+
+      if [[ $curl_exit -ne 0 ]]; then
+        err_json "network_error" "curl failed (exit ${curl_exit})" "true" "{}" ""; exit 1
+      fi
+
+      if [[ "$http_status" == "200" ]]; then
+        jq -n --arg v "$ARK_VERSION" --arg k "$masked" \
+          '{ok:true,cli_version:$v,data:{authenticated:true,api_key:$k}}'
+      else
+        jq -n --arg v "$ARK_VERSION" --arg k "$masked" --arg s "$http_status" \
+          '{ok:true,cli_version:$v,data:{authenticated:false,api_key:$k,error:"invalid_key",http_status:$s}}'
+      fi
+      ;;
+    *) err_json "bad_argument" "Unknown auth subcommand: ${sub}. Use: status" "false" "{}" "ark auth status"; exit 2 ;;
+  esac
+}
+
+# ─── config ────────────────────────────────────────────────────────────────────
+cmd_config() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    set)
+      local key="${1:-}" value="${2:-}"
+      [[ -z "$key" || -z "$value" ]] && {
+        err_json "bad_argument" "Usage: ark config set <key> <value>" "false" "{}" "ark config set url <url>"
+        exit 2
+      }
+      config_set "$key" "$value"
+      jq -n --arg v "$ARK_VERSION" --arg k "$key" --arg val "$value" \
+        '{ok:true,cli_version:$v,data:{key:$k,value:$val}}'
+      ;;
+    get)
+      local key="${1:-}"
+      [[ -z "$key" ]] && {
+        err_json "bad_argument" "Usage: ark config get <key>" "false" "{}" "ark config get url"
+        exit 2
+      }
+      local val; val=$(config_get "$key")
+      jq -n --arg v "$ARK_VERSION" --arg k "$key" --arg val "$val" \
+        '{ok:true,cli_version:$v,data:{key:$k,value:$val}}'
+      ;;
+    list)
+      local url; url=$(config_get "url")
+      local raw_key; raw_key=$(config_get "api-key")
+      local masked_key=""
+      [[ -n "$raw_key" ]] && masked_key="${raw_key:0:4}***"
+      jq -n --arg v "$ARK_VERSION" \
+        --arg url "${url:-}" \
+        --arg key "${masked_key}" \
+        '{ok:true,cli_version:$v,data:{url:$url,"api-key":$key}}'
+      ;;
+    *) err_json "bad_argument" "Unknown config subcommand: ${sub}. Use: set, get, list" "false" "{}" ""; exit 2 ;;
+  esac
+}
+
+# ─── tasks list ────────────────────────────────────────────────────────────────
+cmd_tasks_list() {
+  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status=*)   status_f="${1#--status=}" ;;
+      --status)     shift; status_f="$1" ;;
+      --priority=*) priority_f="${1#--priority=}" ;;
+      --priority)   shift; priority_f="$1" ;;
+      --limit=*)    limit="${1#--limit=}" ;;
+      --limit)      shift; limit="$1" ;;
+      --cursor=*)   cursor="${1#--cursor=}" ;;
+      --cursor)     shift; cursor="$1" ;;
+      --all)        limit=100 ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  local q="?limit=${limit}"
+  [[ -n "$status_f" ]]   && q+="&status=${status_f}"
+  [[ -n "$priority_f" ]] && q+="&priority=${priority_f}"
+  [[ -n "$cursor" ]]     && q+="&cursor=${cursor}"
+
+  http_request "GET" "/api/tasks${q}"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.status)] \(.id) — \(.title)"'
+    echo "count: $(printf '%s' "$meta" | jq -r '.count // 0')"
+    return
+  fi
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks get ─────────────────────────────────────────────────────────────────
+cmd_tasks_get() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks get <id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/${id}"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq '.'
+    echo "next_commands:"; printf '%s' "$cmds" | jq '.'
+    return
+  fi
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks create ──────────────────────────────────────────────────────────────
+cmd_tasks_create() {
+  local title="" desc="" priority="" deadline="" ctx="" status="" task_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title=*)       title="${1#--title=}" ;;
+      --title)         shift; title="$1" ;;
+      --description=*) desc="${1#--description=}" ;;
+      --description)   shift; desc="$1" ;;
+      --priority=*)    priority="${1#--priority=}" ;;
+      --priority)      shift; priority="$1" ;;
+      --deadline=*)    deadline="${1#--deadline=}" ;;
+      --deadline)      shift; deadline="$1" ;;
+      --context=*)     ctx="${1#--context=}" ;;
+      --context)       shift; ctx="$1" ;;
+      --status=*)      status="${1#--status=}" ;;
+      --status)        shift; status="$1" ;;
+      --type=*)        task_type="${1#--type=}" ;;
+      --type)          shift; task_type="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$title" ]] && { err_json "bad_argument" "--title is required" "false" "{}" "ark tasks create --title \"<title>\""; exit 2; }
+
+  local body
+  body=$(jq -n \
+    --arg title "$title" --arg desc "$desc" --arg priority "$priority" \
+    --arg deadline "$deadline" --arg status "$status" --arg ttype "$task_type" \
+    '{title:$title}
+     + (if $desc != "" then {description:$desc} else {} end)
+     + (if $priority != "" then {priority:$priority} else {} end)
+     + (if $deadline != "" then {deadline_at:$deadline} else {} end)
+     + (if $status != "" then {status:$status} else {} end)
+     + (if $ttype != "" then {task_type:$ttype} else {} end)')
+
+  if [[ -n "$ctx" ]]; then
+    printf '%s' "$ctx" | jq -e '.' &>/dev/null 2>&1 || { err_json "bad_argument" "--context must be valid JSON" "false" "{}" ""; exit 2; }
+    body=$(printf '%s' "$ctx" | jq -n --argjson base "$body" 'input as $c | $base + {context:$c}')
+  fi
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/tasks" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds task_id
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  task_id=$(printf '%s' "$data" | jq -r '.id // ""')
+  cmds=$(next_cmds "$task_id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks update ──────────────────────────────────────────────────────────────
+cmd_tasks_update() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks update <id> --log-path <path>"; exit 2; }
+
+  local log_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --log-path=*) log_path="${1#--log-path=}" ;;
+      --log-path)   shift; log_path="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$log_path" ]] && { err_json "bad_argument" "--log-path is required" "false" "{}" "ark tasks update ${id} --log-path <path>"; exit 2; }
+
+  local body; body=$(jq -n --arg p "$log_path" '{log_path:$p}')
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "PATCH" "/api/tasks/${id}" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks context ─────────────────────────────────────────────────────────────
+cmd_tasks_context() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks context <id> --data '<json>'"; exit 2; }
+
+  local ctx="" clear_ctx="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --data=*)  ctx="${1#--data=}" ;;
+      --data)    shift; ctx="$1" ;;
+      --clear)   clear_ctx="true" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+
+  if [[ "$clear_ctx" == "true" && -n "$ctx" ]]; then
+    err_json "bad_argument" "--data and --clear are mutually exclusive" "false" "{}" ""; exit 2
+  fi
+  if [[ "$clear_ctx" == "false" && -z "$ctx" ]]; then
+    err_json "bad_argument" "--data or --clear is required" "false" "{}" "ark tasks context ${id} --data '<json>' | --clear"; exit 2
+  fi
+
+  local body
+  if [[ "$clear_ctx" == "true" ]]; then
+    body=$(jq -n '{context:null}')
+  else
+    printf '%s' "$ctx" | jq -e '.' &>/dev/null 2>&1 \
+      || { err_json "bad_argument" "--data must be valid JSON" "false" "{}" ""; exit 2; }
+    body=$(printf '%s' "$ctx" | jq -n 'input as $c | {context:$c}')
+  fi
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "PATCH" "/api/tasks/${id}" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks context-set ─────────────────────────────────────────────────────────
+cmd_tasks_context_set() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks context-set <id> --set key=value"; exit 2; }
+
+  local -a pairs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --set=*) pairs+=("${1#--set=}") ;;
+      --set)   shift; pairs+=("$1") ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks context-set <id> --set key=value"; exit 2 ;;
+    esac; shift || true
+  done
+
+  [[ ${#pairs[@]} -eq 0 ]] && { err_json "bad_argument" "At least one --set key=value is required" "false" "{}" "ark tasks context-set <id> --set key=value"; exit 2; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+
+  [[ "$DRY_RUN" == "true" ]] && {
+    local preview="{}"
+    for pair in "${pairs[@]}"; do
+      local k="${pair%%=*}" v="${pair#*=}"
+      if [[ "$v" == "true" || "$v" == "false" ]]; then
+        preview=$(printf '%s' "$preview" | jq --arg k "$k" --argjson v "$v" '. + {($k): $v}')
+      elif [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        preview=$(printf '%s' "$preview" | jq --arg k "$k" --argjson v "$v" '. + {($k): $v}')
+      else
+        preview=$(printf '%s' "$preview" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+      fi
+    done
+    dry_run_response "PATCH" "/api/tasks/${id}" "{\"context_merge\":${preview}}"
+    return
+  }
+
+  # GET current context
+  http_request "GET" "/api/tasks/${id}" "" ""
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+  local current_ctx
+  current_ctx=$(printf '%s' "$HTTP_BODY" | jq -c '.data.context // {}')
+
+  # Merge pairs into current context
+  local merged="$current_ctx"
+  for pair in "${pairs[@]}"; do
+    local k="${pair%%=*}" v="${pair#*=}"
+    if [[ "$v" == "true" || "$v" == "false" ]]; then
+      merged=$(printf '%s' "$merged" | jq --arg k "$k" --argjson v "$v" '. + {($k): $v}')
+    elif [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      merged=$(printf '%s' "$merged" | jq --arg k "$k" --argjson v "$v" '. + {($k): $v}')
+    else
+      merged=$(printf '%s' "$merged" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+    fi
+  done
+
+  local body; body=$(printf '%s' "$merged" | jq -n 'input as $c | {context:$c}')
+  export ARK_IDEMPOTENCY_KEY="$ikey"
+  http_request "PATCH" "/api/tasks/${id}" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks status ──────────────────────────────────────────────────────────────
+cmd_tasks_status() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" ""; exit 2; }
+
+  local status="" confidence="" comment_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status=*)     status="${1#--status=}" ;;
+      --status)       shift; status="$1" ;;
+      --confidence=*) confidence="${1#--confidence=}" ;;
+      --confidence)   shift; confidence="$1" ;;
+      --comment-id=*) comment_id="${1#--comment-id=}" ;;
+      --comment-id)   shift; comment_id="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$status" ]] && { err_json "bad_argument" "--status is required" "false" "{}" ""; exit 2; }
+
+  local body; body=$(jq -n --arg s "$status" '{status:$s}')
+  [[ -n "$confidence" ]] && body=$(printf '%s' "$body" | jq --argjson c "$confidence" '. + {confidence_score:$c}')
+  [[ -n "$comment_id" ]] && body=$(printf '%s' "$body" | jq --arg cid "$comment_id" '. + {comment_id:$cid}')
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}/status" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "PATCH" "/api/tasks/${id}/status" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks claim ───────────────────────────────────────────────────────────────
+cmd_tasks_claim() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks claim <id>"; exit 2; }
+
+  local body='{"status":"in_progress"}'
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}/status" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "PATCH" "/api/tasks/${id}/status" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks complete ────────────────────────────────────────────────────────────
+cmd_tasks_complete() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks complete <id> --confidence <0.0-1.0>"; exit 2; }
+
+  local confidence=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --confidence=*) confidence="${1#--confidence=}" ;;
+      --confidence)   shift; confidence="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$confidence" ]] && { err_json "bad_argument" "--confidence is required" "false" "{}" "ark tasks complete ${id} --confidence <0.0-1.0>"; exit 2; }
+
+  local target
+  if awk "BEGIN {exit !($confidence >= 0.85)}"; then
+    target="done"
+  else
+    target="review"
+  fi
+
+  local body; body=$(jq -n --arg s "$target" --argjson c "$confidence" '{status:$s,confidence_score:$c}')
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}/status" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "PATCH" "/api/tasks/${id}/status" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks block ───────────────────────────────────────────────────────────────
+cmd_tasks_block() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks block <id> --reason \"<reason>\""; exit 2; }
+
+  local reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason=*) reason="${1#--reason=}" ;;
+      --reason)   shift; reason="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$reason" ]] && { err_json "bad_argument" "--reason is required" "false" "{}" "ark tasks block ${id} --reason \"<reason>\""; exit 2; }
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    jq -n --arg v "$ARK_VERSION" --arg r "$reason" \
+      '{ok:true,cli_version:$v,dry_run:true,data:{steps:["POST /api/tasks/<id>/comments {label:blocker}","PATCH /api/tasks/<id>/status {status:blocked}"],reason:$r}}'
+    return
+  fi
+
+  local base_key="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+
+  local cbody; cbody=$(jq -n --arg b "$reason" '{body:$b,label:"blocker"}')
+  http_request "POST" "/api/tasks/${id}/comments" "$cbody" "${base_key}:comment"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+  local comment_id; comment_id=$(printf '%s' "$HTTP_BODY" | jq -r '.data.id // ""')
+
+  local sbody='{"status":"blocked"}'
+  http_request "PATCH" "/api/tasks/${id}/status" "$sbody" "${base_key}:status"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c --arg cid "$comment_id" '.data // {} | . + {blocker_comment_id:$cid}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks events ──────────────────────────────────────────────────────────────
+cmd_tasks_events() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks events <id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/${id}/events"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.created_at)] \(.event_type) (\(.actor_type))"'
+    return
+  fi
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks delete ──────────────────────────────────────────────────────────────
+cmd_tasks_delete() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks delete <id>"; exit 2; }
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "DELETE" "/api/tasks/${id}"; return; }
+
+  http_request "DELETE" "/api/tasks/${id}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}' 2>/dev/null || echo '{}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks inputs list ─────────────────────────────────────────────────────────
+cmd_tasks_inputs_list() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks inputs list <id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/${id}/inputs"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "\(.path_type // "?"):\t\(.path)"'
+    return
+  fi
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks inputs add ──────────────────────────────────────────────────────────
+cmd_tasks_inputs_add() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks inputs add <id> --path <path>"; exit 2; }
+
+  local path="" path_type="" desc=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path=*)        path="${1#--path=}" ;;
+      --path)          shift; path="$1" ;;
+      --type=*)        path_type="${1#--type=}" ;;
+      --type)          shift; path_type="$1" ;;
+      --description=*) desc="${1#--description=}" ;;
+      --description)   shift; desc="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$path" ]] && { err_json "bad_argument" "--path is required" "false" "{}" "ark tasks inputs add ${id} --path <path>"; exit 2; }
+
+  local body
+  body=$(jq -n --arg p "$path" --arg t "$path_type" --arg d "$desc" \
+    '{path:$p}
+     + (if $t != "" then {path_type:$t} else {} end)
+     + (if $d != "" then {description:$d} else {} end)')
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/inputs" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/tasks/${id}/inputs" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks inputs upload ───────────────────────────────────────────────────────
+cmd_tasks_inputs_upload() {
+  local id="${1:-}"; shift || true
+  local file_path="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks inputs upload <id> <file-path>"; exit 2; }
+  [[ -z "$file_path" ]] && { err_json "bad_argument" "File path required" "false" "{}" "ark tasks inputs upload ${id} <file-path>"; exit 2; }
+  [[ -f "$file_path" ]] || { err_json "bad_argument" "File not found: ${file_path}" "false" "{}" ""; exit 2; }
+
+  local desc="" local_path="" path_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --description=*) desc="${1#--description=}" ;;
+      --description)   shift; desc="$1" ;;
+      --local-path=*)  local_path="${1#--local-path=}" ;;
+      --local-path)    shift; local_path="$1" ;;
+      --path-type=*)   path_type="${1#--path-type=}" ;;
+      --path-type)     shift; path_type="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+
+  [[ -z "$local_path" ]] && local_path=$(abs_path "$file_path")
+
+  local size_bytes; size_bytes=$(file_size_bytes "$file_path")
+  if [[ -n "$size_bytes" && "$size_bytes" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
+    err_json "payload_too_large" "File exceeds 50MB upload limit" "false" \
+      "$(jq -n --argjson sz "$size_bytes" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{size_bytes:$sz,max_bytes:$max}')" \
+      "Stage the file to Supabase Storage and use 'ark tasks inputs add --path storage://...' instead"
+    exit 2
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local body
+    body=$(jq -n --arg f "$file_path" --arg lp "$local_path" --arg d "$desc" --arg pt "$path_type" \
+      '{multipart: (
+          {file:("@"+$f), local_path:$lp}
+          + (if $d != "" then {description:$d} else {} end)
+          + (if $pt != "" then {path_type:$pt} else {} end)
+        )}')
+    dry_run_response "POST" "/api/tasks/${id}/inputs/upload" "$body"
+    return
+  fi
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  local fields=("file=@${file_path}" "local_path=${local_path}")
+  [[ -n "$desc" ]]      && fields+=("description=${desc}")
+  [[ -n "$path_type" ]] && fields+=("path_type=${path_type}")
+
+  http_upload "POST" "/api/tasks/${id}/inputs/upload" "$ikey" "${fields[@]}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks inputs remove ───────────────────────────────────────────────────────
+cmd_tasks_inputs_remove() {
+  local id="${1:-}" input_id="${2:-}"
+  [[ -z "$id" || -z "$input_id" ]] && { err_json "bad_argument" "Task ID and input ID required" "false" "{}" "ark tasks inputs remove <id> <input-id>"; exit 2; }
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "DELETE" "/api/tasks/${id}/inputs/${input_id}"; return; }
+
+  http_request "DELETE" "/api/tasks/${id}/inputs/${input_id}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}' 2>/dev/null || echo '{}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks comments list ───────────────────────────────────────────────────────
+cmd_tasks_comments_list() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks comments list <id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/${id}/comments"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.label)] \(.author_type): \(.body | .[0:100])"'
+    return
+  fi
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks comments post ───────────────────────────────────────────────────────
+cmd_tasks_comments_post() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks comments post <id> --type <type> --body <body>"; exit 2; }
+
+  local label="" body_text=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type=*) label="${1#--type=}" ;;
+      --type)   shift; label="$1" ;;
+      --body=*) body_text="${1#--body=}" ;;
+      --body)   shift; body_text="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$label" || -z "$body_text" ]] && { err_json "bad_argument" "--type and --body are required" "false" "{}" "ark tasks comments post ${id} --type <type> --body \"<body>\""; exit 2; }
+
+  local body; body=$(jq -n --arg b "$body_text" --arg l "$label" '{body:$b,label:$l}')
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/comments" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/tasks/${id}/comments" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks comments edit ───────────────────────────────────────────────────────
+cmd_tasks_comments_edit() {
+  local id="${1:-}" comment_id="${2:-}"; shift 2 || true
+  [[ -z "$id" || -z "$comment_id" ]] && { err_json "bad_argument" "Task ID and comment ID required" "false" "{}" "ark tasks comments edit <id> <comment-id> --body <text>"; exit 2; }
+
+  local body_text=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --body=*) body_text="${1#--body=}" ;;
+      --body)   shift; body_text="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$body_text" ]] && { err_json "bad_argument" "--body is required" "false" "{}" "ark tasks comments edit ${id} ${comment_id} --body \"<text>\""; exit 2; }
+
+  local body; body=$(jq -n --arg b "$body_text" '{body:$b}')
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}/comments/${comment_id}" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "PATCH" "/api/tasks/${id}/comments/${comment_id}" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks comments delete ─────────────────────────────────────────────────────
+cmd_tasks_comments_delete() {
+  local id="${1:-}" comment_id="${2:-}"
+  [[ -z "$id" || -z "$comment_id" ]] && { err_json "bad_argument" "Task ID and comment ID required" "false" "{}" "ark tasks comments delete <id> <comment-id>"; exit 2; }
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "DELETE" "/api/tasks/${id}/comments/${comment_id}"; return; }
+
+  http_request "DELETE" "/api/tasks/${id}/comments/${comment_id}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}' 2>/dev/null || echo '{}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks outputs list ────────────────────────────────────────────────────────
+cmd_tasks_outputs_list() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks outputs list <id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/${id}/outputs"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[v\(.version)] \(.output_type)/\(.label) \(.size_bytes // 0)B"'
+    return
+  fi
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks outputs submit ──────────────────────────────────────────────────────
+cmd_tasks_outputs_submit() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks outputs submit <id> --type <type> --label <label>"; exit 2; }
+
+  local otype="" label="" data_json="" storage_path="" size_bytes=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type=*)         otype="${1#--type=}" ;;
+      --type)           shift; otype="$1" ;;
+      --label=*)        label="${1#--label=}" ;;
+      --label)          shift; label="$1" ;;
+      --data=*)         data_json="${1#--data=}" ;;
+      --data)           shift; data_json="$1" ;;
+      --storage-path=*) storage_path="${1#--storage-path=}" ;;
+      --storage-path)   shift; storage_path="$1" ;;
+      --size=*)         size_bytes="${1#--size=}" ;;
+      --size)           shift; size_bytes="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$otype" || -z "$label" ]] && { err_json "bad_argument" "--type and --label are required" "false" "{}" "ark tasks outputs submit ${id} --type <type> --label <label>"; exit 2; }
+
+  local body; body=$(jq -n --arg t "$otype" --arg l "$label" '{output_type:$t,label:$l}')
+
+  if [[ -n "$data_json" ]]; then
+    printf '%s' "$data_json" | jq -e '.' &>/dev/null 2>&1 || { err_json "bad_argument" "--data must be valid JSON" "false" "{}" ""; exit 2; }
+    body=$(printf '%s' "$data_json" | jq -n --argjson base "$body" 'input as $d | $base + {data:$d}')
+  fi
+  [[ -n "$storage_path" ]] && body=$(printf '%s' "$body" | jq --arg sp "$storage_path" '. + {storage_path:$sp}')
+  [[ -n "$size_bytes" ]]   && body=$(printf '%s' "$body" | jq --argjson sz "$size_bytes" '. + {size_bytes:$sz}')
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/outputs" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/tasks/${id}/outputs" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks outputs upload ──────────────────────────────────────────────────────
+cmd_tasks_outputs_upload() {
+  local id="${1:-}"; shift || true
+  local file_path="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks outputs upload <id> <file-path> --type <type> --label <label>"; exit 2; }
+  [[ -z "$file_path" ]] && { err_json "bad_argument" "File path required" "false" "{}" "ark tasks outputs upload ${id} <file-path> --type <type> --label <label>"; exit 2; }
+  [[ -f "$file_path" ]] || { err_json "bad_argument" "File not found: ${file_path}" "false" "{}" ""; exit 2; }
+
+  local otype="" label="" local_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type=*)       otype="${1#--type=}" ;;
+      --type)         shift; otype="$1" ;;
+      --label=*)      label="${1#--label=}" ;;
+      --label)        shift; label="$1" ;;
+      --local-path=*) local_path="${1#--local-path=}" ;;
+      --local-path)   shift; local_path="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$otype" || -z "$label" ]] && { err_json "bad_argument" "--type and --label are required" "false" "{}" "ark tasks outputs upload ${id} ${file_path} --type <json|text|file|screenshot|log> --label <report|artifact|error_log|progress|diff>"; exit 2; }
+
+  [[ -z "$local_path" ]] && local_path=$(abs_path "$file_path")
+
+  local size_bytes; size_bytes=$(file_size_bytes "$file_path")
+  if [[ -n "$size_bytes" && "$size_bytes" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
+    err_json "payload_too_large" "File exceeds 50MB upload limit" "false" \
+      "$(jq -n --argjson sz "$size_bytes" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{size_bytes:$sz,max_bytes:$max}')" \
+      "Stage the file to Supabase Storage and use 'ark tasks outputs submit --storage-path storage://... --size <bytes>' instead"
+    exit 2
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local body
+    body=$(jq -n --arg f "$file_path" --arg t "$otype" --arg l "$label" --arg lp "$local_path" \
+      '{multipart:{file:("@"+$f),output_type:$t,label:$l,local_path:$lp}}')
+    dry_run_response "POST" "/api/tasks/${id}/outputs/upload" "$body"
+    return
+  fi
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  local fields=("file=@${file_path}" "output_type=${otype}" "label=${label}" "local_path=${local_path}")
+
+  http_upload "POST" "/api/tasks/${id}/outputs/upload" "$ikey" "${fields[@]}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks outputs get ─────────────────────────────────────────────────────────
+cmd_tasks_outputs_get() {
+  local id="${1:-}" output_id="${2:-}"
+  [[ -z "$id" || -z "$output_id" ]] && { err_json "bad_argument" "Task ID and output ID required" "false" "{}" "ark tasks outputs get <id> <output-id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/${id}/outputs/${output_id}"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks documents url ───────────────────────────────────────────────────────
+cmd_tasks_documents_url() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    url)
+      local id="${1:-}" kind="${2:-}" record_id="${3:-}"
+      [[ -z "$id" || -z "$kind" || -z "$record_id" ]] && {
+        err_json "bad_argument" "Task ID, kind (input|output), and record ID required" "false" "{}" \
+          "ark tasks documents url <id> <input|output> <record-id>"
+        exit 2
+      }
+      if [[ "$kind" != "input" && "$kind" != "output" ]]; then
+        err_json "bad_argument" "kind must be 'input' or 'output', got: ${kind}" "false" "{}" ""; exit 2
+      fi
+
+      [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "/api/tasks/${id}/documents/${kind}/${record_id}/url" ""; return; }
+
+      http_request "GET" "/api/tasks/${id}/documents/${kind}/${record_id}/url"
+      [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+      local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+      if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+        printf '%s' "$data" | jq -r '.url'
+        return
+      fi
+      ok_response "$data" "{}" "{}"
+      ;;
+    *) err_json "bad_argument" "Unknown documents subcommand: ${sub}. Use: url" "false" "{}" "ark tasks documents url <id> <input|output> <record-id>"; exit 2 ;;
+  esac
+}
+
+# ─── knowledge files list ──────────────────────────────────────────────────────
+cmd_knowledge_files_list() {
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "/api/audit/knowledge/files"; return; }
+
+  http_request "GET" "/api/audit/knowledge/files"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r '
+      to_entries[] |
+      .key as $cat |
+      (if (.value | type) == "array" then
+        .value[] | "[\($cat)] \(.name) (\(.size) bytes)"
+      else
+        .value | to_entries[] |
+        .key as $sub |
+        .value[] | "[\($cat)/\($sub)] \(.name) (\(.size) bytes)"
+      end)'
+    return
+  fi
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── knowledge files url (download) ────────────────────────────────────────────
+cmd_knowledge_files_url() {
+  local path="${1:-}" name="${2:-}"; shift 2 || true
+  [[ -z "$path" || -z "$name" ]] && { err_json "bad_argument" "path and name are required" "false" "{}" "ark knowledge files url <path> <name> [--output=<local-path>]"; exit 2; }
+
+  local output_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output=*) output_path="${1#--output=}" ;;
+      --output)   shift; output_path="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$output_path" ]] && output_path="./${name}"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_run_response "GET" "/api/audit/knowledge/files/url?path=${path}&name=${name}"
+    return
+  fi
+
+  local encoded_path encoded_name
+  encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+  encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
+
+  http_request "GET" "/api/audit/knowledge/files/url?path=${encoded_path}&name=${encoded_name}"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local signed_url expires_at storage_path
+  signed_url=$(printf '%s' "$HTTP_BODY" | jq -r '.data.url // empty')
+  expires_at=$(printf '%s' "$HTTP_BODY" | jq -r '.data.expires_at // empty')
+  storage_path=$(printf '%s' "$HTTP_BODY" | jq -r '.data.path // empty')
+
+  [[ -z "$signed_url" ]] && { err_json "storage_error" "No signed URL returned" "false" "{}" ""; exit 1; }
+
+  local dl_exit=0
+  set +e
+  curl --silent --show-error --location --output "$output_path" "$signed_url"
+  dl_exit=$?
+  set -e
+
+  if [[ $dl_exit -ne 0 ]]; then
+    err_json "network_error" "Download failed (curl exit ${dl_exit})" "true" "{}" ""
+    exit 1
+  fi
+
+  local size_bytes; size_bytes=$(file_size_bytes "$output_path" 2>/dev/null || echo 0)
+  local local_path; local_path=$(abs_path "$output_path")
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf 'Downloaded: %s (%s bytes)\n' "$local_path" "$size_bytes"
+    return
+  fi
+
+  ok_response "$(jq -n \
+    --arg url "$signed_url" --arg exp "$expires_at" \
+    --arg sp "$storage_path" --arg lp "$local_path" \
+    --argjson sz "$size_bytes" \
+    '{url:$url,expires_at:$exp,path:$sp,local_path:$lp,size_bytes:$sz}')" "{}" "{}"
+}
+
+# ─── knowledge upload ───────────────────────────────────────────────────────────
+cmd_knowledge_upload() {
+  local file_path="${1:-}"; shift || true
+  [[ -z "$file_path" ]] && { err_json "bad_argument" "File path required" "false" "{}" "ark knowledge upload <file> --folder <folder>"; exit 2; }
+  [[ -f "$file_path" ]] || { err_json "bad_argument" "File not found: ${file_path}" "false" "{}" ""; exit 2; }
+
+  local folder="" subfolder="" desc=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --folder=*)      folder="${1#--folder=}" ;;
+      --folder)        shift; folder="$1" ;;
+      --subfolder=*)   subfolder="${1#--subfolder=}" ;;
+      --subfolder)     shift; subfolder="$1" ;;
+      --description=*) desc="${1#--description=}" ;;
+      --description)   shift; desc="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$folder" ]] && { err_json "bad_argument" "--folder is required (administrativo|medico|financiero|plantillas)" "false" "{}" "ark knowledge upload ${file_path} --folder <folder>"; exit 2; }
+
+  local size_bytes; size_bytes=$(file_size_bytes "$file_path")
+  if [[ -n "$size_bytes" && "$size_bytes" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
+    err_json "payload_too_large" "File exceeds 50MB upload limit" "false" \
+      "$(jq -n --argjson sz "$size_bytes" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{size_bytes:$sz,max_bytes:$max}')" ""
+    exit 2
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local body
+    body=$(jq -n --arg f "$file_path" --arg fo "$folder" --arg sf "$subfolder" --arg d "$desc" \
+      '{multipart:{file:("@"+$f),folder:$fo,subfolder:$sf,description:$d}}')
+    dry_run_response "POST" "/api/audit/knowledge/upload" "$body"
+    return
+  fi
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  local fields=("file=@${file_path}" "folder=${folder}")
+  [[ -n "$subfolder" ]] && fields+=("subfolder=${subfolder}")
+  [[ -n "$desc" ]]      && fields+=("description=${desc}")
+
+  http_upload "POST" "/api/audit/knowledge/upload" "$ikey" "${fields[@]}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── audit ─────────────────────────────────────────────────────────────────────
+cmd_audit() {
+  local operacion="${1:-}"; shift || true
+  [[ -z "$operacion" ]] && {
+    err_json "bad_argument" "Usage: ark audit <operacion> [arg]" "false" "{}" "ark audit <operacion> <arg>"
+    exit 2
+  }
+
+  local ark_dir; ark_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local scripts_dir="${ARK_SCRIPTS_DIR:-${ark_dir}/scripts}"
+  local script_path="${scripts_dir}/${operacion}.ts"
+
+  if [[ ! -f "$script_path" ]]; then
+    local available_ops=()
+    local f
+    for f in "${scripts_dir}"/*.ts; do
+      [[ -f "$f" ]] && available_ops+=("$(basename "$f" .ts)")
+    done
+    local avail_json
+    if [[ ${#available_ops[@]} -gt 0 ]]; then
+      avail_json=$(printf '%s\n' "${available_ops[@]}" | jq -R '.' | jq -s '.')
+    else
+      avail_json='[]'
+    fi
+    local avail_hint
+    if [[ ${#available_ops[@]} -eq 0 ]]; then
+      avail_hint="No operations available in ${scripts_dir}"
+    else
+      avail_hint="Available: ${available_ops[*]}"
+    fi
+    err_json "bad_argument" "Unknown audit operation: ${operacion}" "false" \
+      "{\"available_operations\":${avail_json}}" \
+      "$avail_hint"
+    exit 2
+  fi
+
+  if ! command -v npx &>/dev/null; then
+    err_json "missing_dependency" "npx not found. Required to run audit scripts." "false" "{}" "Install Node.js: https://nodejs.org"
+    exit 1
+  fi
+
+  local exit_code=0
+  local stderr_file; stderr_file=$(mktemp)
+
+  set +e
+  npx tsx "$script_path" "$@" 2>"$stderr_file"
+  exit_code=$?
+  set -e
+
+  if [[ $exit_code -ne 0 ]]; then
+    cat "$stderr_file" >&2
+    rm -f "$stderr_file"
+    exit "$exit_code"
+  fi
+
+  rm -f "$stderr_file"
+}
+
+# ─── skills ────────────────────────────────────────────────────────────────────
+cmd_skills() {
+  jq -n --arg v "$ARK_VERSION" '{
+    ok: true,
+    cli_version: $v,
+    data: {
+      workflows: {
+        execute_queued_task: [
+          "TASK_RUN_ID=$(ark gen-uuid)",
+          "TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r \".data[0].id\")",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:claim\"",
+          "ark tasks claim \"$TASK_ID\"",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:workspace\"",
+          "ark tasks update \"$TASK_ID\" --log-path \"storage://tasks/${TASK_ID}/workspace/\"",
+          "ark tasks inputs list \"$TASK_ID\" | jq -r \".data[].path\"",
+          "# Write the final output in the format the task context requires",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
+          "ark tasks outputs upload \"$TASK_ID\" /tmp/output-${TASK_ID}.json --type file --label report",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
+          "ark tasks complete \"$TASK_ID\" --confidence 0.92"
+        ],
+        create_followon_task: [
+          "ark tasks create --title \"Follow-on work\" --status queued --context \"{}\""
+        ],
+        signal_blocker: [
+          "ark tasks block \"$TASK_ID\" --reason \"Missing credentials for X\""
+        ],
+        handle_requeue: [
+          "# Read what changed",
+          "ark tasks comments list \"$TASK_ID\" | jq \".data[-1]\"",
+          "# Re-claim",
+          "ark tasks claim \"$TASK_ID\""
+        ],
+        upload_output: [
+          "# Primary deliverable: final output in the format the task context requires",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
+          "ark tasks outputs upload \"$TASK_ID\" /tmp/output-${TASK_ID}.ext --type file --label report"
+        ],
+        upload_output_artifact: [
+          "# Complementary file that supports the primary deliverable",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:artifact\"",
+          "ark tasks outputs upload \"$TASK_ID\" ./chart.png --type screenshot --label artifact"
+        ],
+        upload_progress: [
+          "# Intermediate work product: reasoning / plan / findings — one per phase boundary",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:progress:1\"",
+          "ark tasks outputs upload \"$TASK_ID\" ./phase-1-plan.md --type text --label progress"
+        ],
+        upload_progress_log: [
+          "# Runtime log as supporting evidence for a milestone — NOT the primary milestone doc",
+          "# (Use upload_progress_milestone for the markdown milestone doc itself)",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:progress:2:log\"",
+          "ark tasks outputs upload \"$TASK_ID\" ./phase-2-trace.log --type log --label progress"
+        ],
+        upload_input_file: [
+          "# Attach a file to a task as an input (typically when seeding a follow-on task)",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:input:upload:1\"",
+          "ark tasks inputs upload \"$FOLLOWON_TASK_ID\" ./seed-data.csv --description \"Extracted from parent task\""
+        ],
+        fetch_document_url: [
+          "# Get a short-lived signed URL (~1h) to download a stored input or output",
+          "ark tasks documents url \"$TASK_ID\" output \"$OUTPUT_ID\" | jq -r '.data.url'"
+        ],
+        batch_denial_mail: [
+          "# Paso 1 — detectar que la tarea es de tipo batch-denial-mail",
+          "ark tasks list --status queued --limit 1 | jq -r \".data[0].task_type\"",
+          "# Paso 2 — tomar la tarea",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:claim\"",
+          "ark tasks claim \"$TASK_ID\"",
+          "# Paso 3 — ejecutar el script (NO hacer esto manualmente)",
+          "RESULT=$(ark audit send-denial-mail \"$TASK_ID\")",
+          "# Paso 4 — leer stdout para obtener los datos del correo",
+          "EMAIL=$(echo $RESULT | jq -r \".email_destino\")",
+          "PRESTADOR=$(echo $RESULT | jq -r \".prestador_nombre\")",
+          "ITEMS=$(echo $RESULT | jq -r \".total_items_glosados\")",
+          "STORAGE=$(echo $RESULT | jq -r \".storage_path\")",
+          "# Paso 5 — enviar correo vía GOG con el Excel adjunto desde storage",
+          "# (el agente construye el asunto y cuerpo con los campos del stdout)",
+          "# Paso 6 — actualizar contexto",
+          "ark tasks update \"$TASK_ID\" --context \u0027{\"reply_sent\": true, \"sent_at\": \"<iso>\"}\u0027",
+          "# Paso 7 — completar",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
+          "ark tasks complete \"$TASK_ID\" --confidence 1.0"
+        ]
+      },
+      exit_codes: {
+        "0":  "success",
+        "1":  "generic/network error — check error.retryable",
+        "2":  "bad arguments — do not retry",
+        "3":  "auth error 401/403 — re-authenticate",
+        "4":  "not found 404 — stop this branch",
+        "5":  "conflict/invalid transition 409/422 — fix the request, read error.detail",
+        "29": "rate limited 429 — retry after delay"
+      },
+      env_vars: {
+        ARK_API_URL:         "API base URL (default: http://localhost:3000)",
+        ARK_FORMAT:          "json | human (default: json)",
+        ARK_DEBUG:           "0 | 1 | 2 (default: 0)",
+        ARK_IDEMPOTENCY_KEY: "Reuse to retry a failed action with same key",
+        NO_COLOR:                "Disable ANSI colors"
+      },
+      idempotency_strategy: {
+        pattern:  "Generate TASK_RUN_ID=$(ark gen-uuid) once per execution run",
+        derive:   "${TASK_RUN_ID}:claim, ${TASK_RUN_ID}:workspace, ${TASK_RUN_ID}:output:<label>, ${TASK_RUN_ID}:output:progress:<n>, ${TASK_RUN_ID}:input:upload:<n>, ${TASK_RUN_ID}:complete",
+        on_retry: "Set ARK_IDEMPOTENCY_KEY=<same-key> before rerunning the command"
+      },
+      enums: {
+        output_type:  ["json","text","file","screenshot","log"],
+        output_label: ["report","artifact","error_log","progress","diff"],
+        path_type:    ["filesystem","storage","url"]
+      },
+      upload_limits: {
+        max_file_bytes: 52428800,
+        note: "50 MB per file. Larger artifacts must be staged to Supabase Storage and registered via `outputs submit --storage-path`."
+      },
+      confidence_routing: {
+        ">=0.85": "transitions to done — no human review needed",
+        "<0.85":  "transitions to review — awaits human approval"
+      },
+      output_envelope: {
+        ok:               "boolean",
+        cli_version:      "semver string",
+        data:             "object or array of results",
+        "_links":         "API affordances keyed by action name",
+        next_commands:    "ready-to-run Tasks Ark CLI commands keyed by action name",
+        idempotent_replay:"boolean — true when response came from idempotency cache",
+        request_id:       "uuid for log correlation with API",
+        meta:             "(list responses only) count and next_cursor"
+      },
+      task_types: {
+        "general":             "Razona y ejecuta con instrucciones en context. Usar workflow execute_queued_task.",
+        "eps_audit":           "Audita factura médica en 3 capas. Usar workflow execute_queued_task.",
+        "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
+        "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
+        "batch-denial-mail":   "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail."
+      },
+      audit_subcommand: {
+        usage:       "ark audit <operacion> [args...]",
+        description: "Ejecuta un script TypeScript determinístico desde scripts/<operacion>.ts usando npx tsx",
+        operations: {
+          "send-denial-mail": {
+            usage:        "ark audit send-denial-mail <batch_task_id>",
+            description:  "Genera el Excel consolidado de ítems glosados y lo sube a Supabase Storage. El agente es responsable de enviar el correo vía GOG después.",
+            env_required: ["SUPABASE_URL","SUPABASE_SERVICE_KEY"],
+            env_optional: ["SUPABASE_STORAGE_BUCKET (default: task-outputs)","ARK_API_URL","ARK_API_KEY"],
+            exit_codes: {
+              "0": "Excel generado y subido — stdout incluye storage_path, email_destino, prestador_nombre, total_items_glosados",
+              "1": "Error recuperable (API, storage) — marcar tarea como blocked",
+              "2": "Argumento inválido o tarea no encontrada — no reintentar"
+            },
+            stdout_on_success: {
+              ok:                   true,
+              batch_task_id:        "<uuid>",
+              excel_filename:       "devoluciones_<nit>_<fecha>.xlsx",
+              storage_path:         "storage://task-outputs/denial-mails/<filename>",
+              total_items_glosados: "<number>",
+              email_destino:        "<email>",
+              prestador_nombre:     "<nombre>"
+            }
+          }
+        }
+      }
+    }
+  }'
+}
+
+# ─── schema ────────────────────────────────────────────────────────────────────
+cmd_schema() {
+  http_request "GET" "/api/openapi.json"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+  echo "$HTTP_BODY"
+}
+
+# ─── check ─────────────────────────────────────────────────────────────────────
+cmd_check() {
+  local check_url="${ARK_CHECK_URL:-https://salmona-api.vercel.app/api/openapi.json}"
+
+  local spec
+  spec=$(curl -fsSL "$check_url") || { err_json "network_error" "Failed to fetch spec from $check_url" "true" "{}" ""; exit 1; }
+
+  local api_fields_json
+  api_fields_json=$(printf '%s' "$spec" | jq -c '[.components.schemas.Task.properties | keys[]]')
+
+  local missing_json extra_json
+  missing_json=$(printf '%s' "$api_fields_json" | jq -c --arg known "$KNOWN_TASK_FIELDS" \
+    '[.[] | select(. as $f | ($known | split(" ") | index($f)) == null)]')
+  extra_json=$(jq -cn --arg known "$KNOWN_TASK_FIELDS" --argjson api "$api_fields_json" \
+    '($known | split(" ")) | map(select(. as $f | ($api | index($f)) == null))')
+
+  local missing_count
+  missing_count=$(printf '%s' "$missing_json" | jq 'length')
+
+  local status="up_to_date"
+  [[ "$missing_count" -gt 0 ]] && status="outdated"
+
+  local cli_fields_json
+  cli_fields_json=$(jq -cn --arg known "$KNOWN_TASK_FIELDS" '$known | split(" ")')
+
+  jq -n \
+    --arg v "$ARK_VERSION" \
+    --arg status "$status" \
+    --arg url "$check_url" \
+    --argjson api_fields "$api_fields_json" \
+    --argjson cli_fields "$cli_fields_json" \
+    --argjson missing "$missing_json" \
+    --argjson extra "$extra_json" \
+    '{ok:true,cli_version:$v,data:{status:$status,spec_url:$url,api_fields:$api_fields,cli_fields:$cli_fields,missing_in_cli:$missing,extra_in_cli:$extra}}'
+
+  [[ "$missing_count" -gt 0 ]] && exit 1
+  exit 0
+}
+
+# ─── version ───────────────────────────────────────────────────────────────────
+cmd_version() {
+  jq -n --arg v "$ARK_VERSION" '{ok:true,cli_version:$v,data:{name:"tasks-ark",version:$v}}'
+}
+
+# ─── update ────────────────────────────────────────────────────────────────────
+cmd_update() {
+  local here updater
+  here="$(cd "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")" 2>/dev/null && pwd || dirname "$0")"
+  updater="${here}/skill.sh"
+  if [[ -x "$updater" ]]; then
+    exec "$updater" "$@"
+  fi
+  exec bash -c 'curl -fsSL "https://raw.githubusercontent.com/${ARK_UPDATE_REPO:-arkangelai/tasks-ark-cli}/main/skill.sh" | bash -s -- "$@"' _ "$@"
+}
+
+# ─── usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  local exit_code="${1:-2}"
+  cat >&2 <<'EOF'
+Tasks Ark — task management CLI for AI agents
+
+SETUP
+  ark config set url <api-url>       Set the API base URL
+  ark config set api-key <key>       Set your API key
+  ark auth status                    Validate key against the API
+
+TASKS
+  ark tasks list                     List tasks
+    [--status=queued|in_progress|blocked|review|done|archived|cancelled]
+    [--priority=low|medium|high|critical]  [--limit=20]  [--cursor=<iso-ts>]  [--all]
+  ark tasks get <id>                 Fetch a single task with next_commands
+  ark tasks create                   Create a task
+    --title=<title>  [--description=]  [--priority=]  [--deadline=]
+    [--context=<json>]  [--status=queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion]
+  ark tasks update <id>              Set workspace log path (agent only)
+    --log-path=<storage-path>
+  ark tasks context <id>             Set or clear the task context (human only)
+    --data='<json>'  |  --clear
+  ark tasks context-set <id>         Merge fields into context without replacing it (agent only)
+    --set key=value  [--set key2=value2 ...]
+  ark tasks status <id>              Transition status manually
+    --status=<status>  [--confidence=]  [--comment-id=]
+  ark tasks claim <id>               Transition queued → in_progress
+  ark tasks complete <id>            Transition to done (>=0.85) or review (<0.85)
+    --confidence=<0.0-1.0>
+  ark tasks block <id>               Post blocker comment + transition → blocked
+    --reason=<reason>
+  ark tasks delete <id>              Delete a draft task (human only)
+  ark tasks events <id>              Full audit timeline (read-only)
+
+INPUTS
+  ark tasks inputs list <id>         List registered input paths
+  ark tasks inputs add <id>          Register an input path (reference only)
+    --path=<path>  [--type=filesystem|storage|url]  [--description=]
+  ark tasks inputs upload <id> <file-path>    Upload a file as an input (≤ 50 MB)
+    [--description=]  [--local-path=]  [--path-type=filesystem|storage|url]
+  ark tasks inputs remove <id> <input-id>   Remove a human-registered input
+
+COMMENTS
+  ark tasks comments list <id>       List all comments
+  ark tasks comments post <id>       Post a comment
+    --type=note|blocker|comment|approved|changes_requested  --body=<text>
+  ark tasks comments edit <id> <comment-id>   Edit own comment body (human only)
+    --body=<text>
+  ark tasks comments delete <id> <comment-id>  Delete own comment (human only)
+
+OUTPUTS
+  ark tasks outputs list <id>        List outputs (ordered by version desc)
+  ark tasks outputs submit <id>      Submit an inline or pre-staged deliverable (agent only)
+    --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
+    [--data=<json>]  [--storage-path=]  [--size=<bytes>]
+  ark tasks outputs upload <id> <file-path>   Upload a file deliverable (agent only, ≤ 50 MB)
+    --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
+    [--local-path=]
+  ark tasks outputs get <id> <output-id>   Fetch a single output
+
+DOCUMENTS
+  ark tasks documents url <id> <input|output> <record-id>
+                                     Get a short-lived (~1h) signed URL for a stored file
+
+AUDIT
+  ark audit <operacion> [arg]        Run a deterministic audit script
+    Resolves to scripts/<operacion>.ts and executes via npx tsx.
+    On error (exit != 0): prints stderr for harness blocking notes.
+    On success: prints stdout of the script.
+
+KNOWLEDGE
+  ark knowledge files list           List all knowledge base files with signed URLs
+  ark knowledge files url <path> <name>  Download a knowledge base file
+    [--output=<local-path>]          Default: ./<name>
+  ark knowledge upload <file>        Upload a file to the knowledge base
+    --folder=<administrativo|medico|financiero|plantillas>
+    [--subfolder=<subfolder>]  [--description=<desc>]
+
+CONFIG
+  ark config set <key> <value>       Write a config value
+  ark config get <key>               Read a config value
+  ark config list                    Show url and masked api-key
+
+UTILITY
+  ark skills                         Full capability map (workflows, exit codes, env vars)
+  ark schema                         Fetch OpenAPI spec from the API
+  ark check                          Compare CLI fields against live API spec (exits 1 if outdated)
+  ark gen-uuid                       Generate a UUID (use for idempotency keys)
+  ark version                        Print CLI version
+  ark update                         Self-update ark, skill.sh, SKILL.md from main
+
+GLOBAL FLAGS
+  --human      Human-readable output instead of JSON
+  --dry-run    Print request without sending it
+
+ENVIRONMENT
+  ARK_API_URL          Override configured API base URL
+  ARK_FORMAT           json | human
+  ARK_DEBUG            0 | 1 | 2  (2 = print full request + response)
+  ARK_IDEMPOTENCY_KEY  Reuse this key on retry to get idempotent response
+  ARK_SCRIPTS_DIR      Override scripts directory (default: <ark-dir>/scripts)
+
+EXIT CODES
+  0   Success
+  1   Network / generic error (check error.retryable)
+  2   Bad arguments
+  3   Auth error 401/403 — run: ark config set api-key <key>
+  4   Not found 404
+  5   Conflict / invalid transition 409/422 (read error.detail)
+  6   Write denied (ark update) — re-run with ARK_UPDATE_SUDO=1
+  29  Rate limited 429 — retry after delay with same idempotency key
+EOF
+  exit "$exit_code"
+}
+
+# ─── main ──────────────────────────────────────────────────────────────────────
+main() {
+  check_deps
+  [[ $# -eq 0 ]] && usage 2
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --human)   HUMAN_OUTPUT=true; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --)        shift; break ;;
+      *)         break ;;
+    esac
+  done
+
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    auth)   cmd_auth "$@" ;;
+    config) cmd_config "$@" ;;
+    tasks)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        list)     cmd_tasks_list "$@" ;;
+        get)      cmd_tasks_get "$@" ;;
+        create)   cmd_tasks_create "$@" ;;
+        update)   cmd_tasks_update "$@" ;;
+        context)      cmd_tasks_context "$@" ;;
+        context-set)  cmd_tasks_context_set "$@" ;;
+        status)       cmd_tasks_status "$@" ;;
+        claim)    cmd_tasks_claim "$@" ;;
+        complete) cmd_tasks_complete "$@" ;;
+        block)    cmd_tasks_block "$@" ;;
+        events)   cmd_tasks_events "$@" ;;
+        delete)   cmd_tasks_delete "$@" ;;
+        inputs)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            list)   cmd_tasks_inputs_list "$@" ;;
+            add)    cmd_tasks_inputs_add "$@" ;;
+            upload) cmd_tasks_inputs_upload "$@" ;;
+            remove) cmd_tasks_inputs_remove "$@" ;;
+            *) err_json "bad_argument" "Unknown inputs subcommand: ${sub2}" "false" "{}" ""; exit 2 ;;
+          esac ;;
+        comments)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            list)   cmd_tasks_comments_list "$@" ;;
+            post)   cmd_tasks_comments_post "$@" ;;
+            edit)   cmd_tasks_comments_edit "$@" ;;
+            delete) cmd_tasks_comments_delete "$@" ;;
+            *) err_json "bad_argument" "Unknown comments subcommand: ${sub2}" "false" "{}" ""; exit 2 ;;
+          esac ;;
+        outputs)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            list)   cmd_tasks_outputs_list "$@" ;;
+            submit) cmd_tasks_outputs_submit "$@" ;;
+            upload) cmd_tasks_outputs_upload "$@" ;;
+            get)    cmd_tasks_outputs_get "$@" ;;
+            *) err_json "bad_argument" "Unknown outputs subcommand: ${sub2}" "false" "{}" ""; exit 2 ;;
+          esac ;;
+        documents) cmd_tasks_documents_url "$@" ;;
+        *) err_json "bad_argument" "Unknown tasks subcommand: ${sub}" "false" "{}" "ark help"; exit 2 ;;
+      esac ;;
+    knowledge)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        files)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            list) cmd_knowledge_files_list "$@" ;;
+            url)  cmd_knowledge_files_url "$@" ;;
+            *) err_json "bad_argument" "Unknown files subcommand: ${sub2}" "false" "{}" "ark knowledge files list|url"; exit 2 ;;
+          esac ;;
+        upload) cmd_knowledge_upload "$@" ;;
+        *) err_json "bad_argument" "Unknown knowledge subcommand: ${sub}" "false" "{}" "ark knowledge files|upload"; exit 2 ;;
+      esac ;;
+    audit)    cmd_audit "$@" ;;
+    skills)   cmd_skills ;;
+    schema)   cmd_schema ;;
+    check)    cmd_check "$@" ;;
+    gen-uuid) gen_uuid ;;
+    version)  cmd_version ;;
+    update)   cmd_update "$@" ;;
+    help|--help|-h) usage 0 ;;
+    *) err_json "bad_argument" "Unknown command: ${cmd}" "false" "{}" "ark help"; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
