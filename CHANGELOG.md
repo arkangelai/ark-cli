@@ -28,6 +28,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   anchos de columna refinados. Guarda el archivo en `tmpdir()` antes de subir y expone
   `local_path` en el stdout para que el agente pueda adjuntarlo directamente con GOG.
 
+### Fixed
+- `ark tasks create --type` y `ark skills` ahora reconocen `hospital_devolucion_batch`.
+  La API ya aceptaba el tipo (vive en `VALID_TASK_TYPES` de Salmona), pero el help del CLI
+  y el mapa `task_types` de `ark skills` no lo listaban, así que los agentes no confiaban en
+  él y caían a `hospital_devolucion`. Ahora el tipo de lote de glosas está advertido.
+
 ---
 
 ## [0.3.3] — 2026-05-07

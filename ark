@@ -1490,6 +1490,7 @@ cmd_skills() {
         "eps_audit":           "Audita factura médica en 3 capas. Usar workflow execute_queued_task.",
         "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
         "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
+        "hospital_devolucion_batch":      "Lote de glosas (Excel/CSV). Procesado por hospital-devolucion-batch-parse, que crea una task hospital_devolucion por glosa.",
         "batch-denial-mail":              "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail.",
         "hospital_preventiva_batch_mail": "DELEGAR a ark audit send-preventiva-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_preventiva_mail."
       },
@@ -1625,7 +1626,7 @@ TASKS
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
-    [--context=<json>]  [--status=queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion]
+    [--context=<json>]  [--status=queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|batch-denial-mail|hospital_preventiva_batch_mail]
   ark tasks update <id>              Set workspace log path (agent only)
     --log-path=<storage-path>
   ark tasks context <id>             Set or clear the task context (human only)
