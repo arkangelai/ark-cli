@@ -18,8 +18,8 @@
  */
 
 import ExcelJS from "exceljs";
-import { readFileSync } from "fs";
-import { homedir } from "os";
+import { readFileSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
 import path from "path";
 
 // ─── Exit codes ────────────────────────────────────────────────────────────────
@@ -241,73 +241,75 @@ async function generateExcel(
   workbook.creator = "Arkangel AI — Auditoría Médica";
   workbook.created = new Date();
 
+  const FONT_BASE = { name: "Calibri", size: 11, color: { theme: 1 } } as const;
+  const FONT_HEADER = { ...FONT_BASE, bold: true } as const;
+  const NUM_FMT_ACCOUNTING = '_-"$" * #,##0_-;-"$" * #,##0_-;_-"$" * "-"??_-;_-@';
+
   // Hoja principal
   const sheet = workbook.addWorksheet("Devoluciones");
+  sheet.views = [{ state: "frozen", ySplit: 1, topLeftCell: "A2" }];
 
-  const columns = [
-    { header: "Nº Factura", key: "num_factura", width: 16 },
-    { header: "Prestador", key: "prestador", width: 30 },
-    { header: "Fecha atención", key: "fecha_atencion", width: 16 },
-    { header: "Código CUPS", key: "codigo_cups", width: 14 },
-    { header: "Descripción", key: "descripcion", width: 40 },
-    { header: "Valor facturado", key: "valor_facturado", width: 18 },
-    { header: "Valor objetado", key: "valor_glosado", width: 18 },
-    { header: "Causal", key: "causal", width: 40 },
-    { header: "Capa", key: "capa", width: 18 },
-    { header: "Regla aplicada", key: "regla_aplicada", width: 30 },
+  sheet.columns = [
+    { header: "Nº Factura",      key: "num_factura",    width: 19.43 },
+    { header: "Prestador",       key: "prestador",      width: 32    },
+    { header: "Fecha atención",  key: "fecha_atencion", width: 16    },
+    { header: "Código CUPS",     key: "codigo_cups",    width: 14    },
+    { header: "Descripción",     key: "descripcion",    width: 43    },
+    { header: "Valor facturado", key: "valor_facturado",width: 28.43 },
+    { header: "Valor objetado",  key: "valor_glosado",  width: 28.43 },
+    { header: "Causal",          key: "causal",         width: 43    },
+    { header: "Capa",            key: "capa",           width: 18    },
+    { header: "Regla aplicada",  key: "regla_aplicada", width: 32.29 },
   ];
 
-  sheet.columns = columns;
-
-  // Header styling
-  sheet.getRow(1).font = { bold: true };
-  sheet.getRow(1).fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FFE8E8E8" },
-  };
+  const headerRow = sheet.getRow(1);
+  headerRow.eachCell((cell, col) => {
+    cell.font = FONT_HEADER;
+    cell.alignment = {
+      horizontal: col <= 2 ? "center" : "left",
+      vertical: "middle",
+      wrapText: false,
+    };
+  });
 
   for (const row of glosas) {
-    sheet.addRow({
-      num_factura: row.num_factura,
-      prestador: row.prestador,
+    const r = sheet.addRow({
+      num_factura:    row.num_factura,
+      prestador:      row.prestador,
       fecha_atencion: row.fecha_atencion,
-      codigo_cups: row.codigo_cups,
-      descripcion: row.descripcion,
-      valor_facturado: row.valor_facturado,
-      valor_glosado: row.valor_glosado,
-      causal: row.causal,
-      capa: row.capa,
+      codigo_cups:    row.codigo_cups,
+      descripcion:    row.descripcion,
+      valor_facturado:row.valor_facturado,
+      valor_glosado:  row.valor_glosado,
+      causal:         row.causal,
+      capa:           row.capa,
       regla_aplicada: row.regla_aplicada,
     });
+    r.font = FONT_BASE;
   }
 
-  // Formato de moneda para columnas de valor
-  ["F", "G"].forEach((col) => {
-    sheet.getColumn(col).numFmt = '#,##0.00';
-  });
+  sheet.getColumn("valor_facturado").numFmt = NUM_FMT_ACCOUNTING;
+  sheet.getColumn("valor_glosado").numFmt   = NUM_FMT_ACCOUNTING;
 
   // Hoja de resumen
   const summary = workbook.addWorksheet("Resumen");
+  summary.views = [{ state: "frozen", ySplit: 1, topLeftCell: "A2" }];
   const totalFacturado = glosas.reduce((sum, r) => sum + r.valor_facturado, 0);
   const totalObjetado = glosas.reduce((sum, r) => sum + r.valor_glosado, 0);
   const tasaObjecion =
     totalFacturado > 0 ? ((totalObjetado / totalFacturado) * 100).toFixed(2) : "0.00";
 
   summary.columns = [{ width: 28 }, { width: 22 }];
-  summary.addRow(["Campo", "Valor"]);
-  summary.getRow(1).font = { bold: true };
-  summary.getRow(1).fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FFE8E8E8" },
-  };
-  summary.addRow(["Prestador NIT", prestadorNit]);
-  summary.addRow(["Total facturado", totalFacturado]);
-  summary.addRow(["Total objetado", totalObjetado]);
-  summary.addRow(["Número de ítems glosados", glosas.length]);
-  summary.addRow(["Tasa de objeción (%)", tasaObjecion]);
-  summary.getColumn(2).numFmt = '#,##0.00';
+  const summaryHeader = summary.addRow(["Campo", "Valor"]);
+  summaryHeader.font = FONT_HEADER;
+  summaryHeader.getCell(1).alignment = { horizontal: "center", vertical: "middle" };
+  summaryHeader.getCell(2).alignment = { horizontal: "center", vertical: "middle" };
+  summary.addRow(["Prestador NIT", prestadorNit]).font = FONT_BASE;
+  summary.addRow(["Total facturado", totalFacturado]).font = FONT_BASE;
+  summary.addRow(["Total objetado", totalObjetado]).font = FONT_BASE;
+  summary.addRow(["Número de ítems glosados", glosas.length]).font = FONT_BASE;
+  summary.addRow(["Tasa de objeción (%)", tasaObjecion]).font = FONT_BASE;
+  summary.getColumn(2).numFmt = NUM_FMT_ACCOUNTING;
 
   const filename = `devoluciones_${prestadorNit}_${fecha}.xlsx`;
   const rawBuffer = await workbook.xlsx.writeBuffer();
@@ -412,7 +414,11 @@ async function main(): Promise<void> {
       fecha
     );
 
-    // Fase 4
+    // Fase 4 — Guardar localmente y subir a storage
+    const localPath = path.join(tmpdir(), filename);
+    writeFileSync(localPath, buffer);
+    log(`Excel saved to ${localPath}`);
+
     log("uploading Excel to Supabase Storage");
     const storagePath = await uploadToStorage(buffer, filename);
 
@@ -431,6 +437,7 @@ async function main(): Promise<void> {
         batch_task_id: batchTaskId,
         excel_filename: filename,
         storage_path: storagePath,
+        local_path: localPath,
         total_items_glosados: glosas.length,
         email_destino: context.email_destino,
         prestador_nombre: context.prestador_nombre,

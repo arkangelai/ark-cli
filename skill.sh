@@ -68,24 +68,27 @@ if CHECKOUT="$(find_checkout "$TARGET_ARK" || find_checkout "$SHARE_DIR")"; then
     err "git_fetch_failed" "git fetch origin ${REF} failed in ${CHECKOUT}" "$CUR"; exit 1; }
   git -C "$CHECKOUT" -c advice.detachedHead=false checkout -f --quiet FETCH_HEAD || {
     err "git_checkout_failed" "git checkout FETCH_HEAD failed in ${CHECKOUT}" "$CUR"; exit 1; }
-  for F in ark install.sh SKILL.md skill.sh; do
+  for F in ark install.sh skill.sh; do
     [ -f "$CHECKOUT/$F" ] || { err "missing_file" "${F} missing in checkout" "$CUR"; exit 1; }
     cp "$CHECKOUT/$F" "$STAGE/$F"
   done
+  [ -d "$CHECKOUT/skills"  ] && cp -r "$CHECKOUT/skills"  "$STAGE/skills"
   [ -d "$CHECKOUT/scripts" ] && cp -r "$CHECKOUT/scripts" "$STAGE/scripts"
 else
-  for F in ark install.sh SKILL.md skill.sh; do
+  for F in ark install.sh skill.sh; do
     curl -fsSL "${RAW_BASE}/${F}" -o "${STAGE}/${F}" || {
       err "download_failed" "Failed to download ${F} from ${RAW_BASE}" "$CUR"; exit 1; }
   done
-  SCRIPTS_JSON="$(curl -fsSL "https://api.github.com/repos/${REPO}/contents/scripts?ref=${REF}" 2>/dev/null || true)"
-  if [ -n "$SCRIPTS_JSON" ] && echo "$SCRIPTS_JSON" | jq -e '.[].name' >/dev/null 2>&1; then
-    mkdir -p "${STAGE}/scripts"
-    while IFS= read -r fname; do
-      curl -fsSL "${RAW_BASE}/scripts/${fname}" -o "${STAGE}/scripts/${fname}" || {
-        err "download_failed" "Failed to download scripts/${fname}" "$CUR"; exit 1; }
-    done < <(echo "$SCRIPTS_JSON" | jq -r '.[].name')
-  fi
+  for FOLDER in skills scripts; do
+    FOLDER_JSON="$(curl -fsSL "https://api.github.com/repos/${REPO}/contents/${FOLDER}?ref=${REF}" 2>/dev/null || true)"
+    if [ -n "$FOLDER_JSON" ] && echo "$FOLDER_JSON" | jq -e '.[].name' >/dev/null 2>&1; then
+      mkdir -p "${STAGE}/${FOLDER}"
+      while IFS= read -r fname; do
+        curl -fsSL "${RAW_BASE}/${FOLDER}/${fname}" -o "${STAGE}/${FOLDER}/${fname}" || {
+          err "download_failed" "Failed to download ${FOLDER}/${fname}" "$CUR"; exit 1; }
+      done < <(echo "$FOLDER_JSON" | jq -r '.[].name')
+    fi
+  done
 fi
 
 # Syntax-check every shell file in the stage before we touch the installed copy.
@@ -132,7 +135,11 @@ do_mv "${STAGE}/skill.sh" "${PREFIX_DIR}/skill.sh" || {
 
 mkdir -p "$SHARE_DIR"
 mv "${STAGE}/install.sh" "${SHARE_DIR}/install.sh"
-mv "${STAGE}/SKILL.md"   "${SHARE_DIR}/SKILL.md"
+
+if [ -d "${STAGE}/skills" ]; then
+  rm -rf "${SHARE_DIR}/skills"
+  mv "${STAGE}/skills" "${SHARE_DIR}/skills"
+fi
 
 if [ -d "${STAGE}/scripts" ]; then
   SCRIPTS_DEST="${PREFIX_DIR}/scripts"
@@ -151,12 +158,12 @@ jq -n \
   --arg cli "$NEW" --arg cur "$CUR" --arg new "$NEW" \
   --arg mode "$MODE" --arg checkout "$CHECKOUT" --arg ark "$TARGET_ARK" \
   --arg bak "$BACKUP" --arg skill "${PREFIX_DIR}/skill.sh" \
-  --arg skill_md "${SHARE_DIR}/SKILL.md" --arg install_sh "${SHARE_DIR}/install.sh" \
+  --arg skills_dir "${SHARE_DIR}/skills" --arg install_sh "${SHARE_DIR}/install.sh" \
   --arg sudo_used "$SUDO_USED" \
   '{ok:true,cli_version:$cli,data:{
       mode:$mode, checkout:$checkout,
       previous_version:$cur, new_version:$new,
       ark_path:$ark, skill_path:$skill,
-      skill_md_path:$skill_md, install_sh_path:$install_sh,
+      skills_dir:$skills_dir, install_sh_path:$install_sh,
       backup:$bak, sudo_used:$sudo_used
     }}'

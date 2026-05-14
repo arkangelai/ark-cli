@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARK_SRC="${SCRIPT_DIR}/ark"
 SKILL_SRC="${SCRIPT_DIR}/skill.sh"
-SKILL_MD_SRC="${SCRIPT_DIR}/SKILL.md"
 INSTALL_SRC="${SCRIPT_DIR}/install.sh"
 SCRIPTS_SRC="${SCRIPT_DIR}/scripts"
+SKILLS_SRC="${SCRIPT_DIR}/skills"
 
 if [[ ! -f "$ARK_SRC" ]]; then
   echo "Error: task script not found at ${ARK_SRC}" >&2
@@ -35,8 +35,11 @@ if [[ -f "$SKILL_SRC" ]]; then
   chmod +x "${PREFIX}/skill.sh"
 fi
 
-[[ -f "$SKILL_MD_SRC" ]] && cp "$SKILL_MD_SRC" "${SHARE_DIR}/SKILL.md"
 [[ -f "$INSTALL_SRC"  ]] && cp "$INSTALL_SRC"  "${SHARE_DIR}/install.sh"
+
+if [[ -d "$SKILLS_SRC" ]]; then
+  cp -r "$SKILLS_SRC" "${SHARE_DIR}/skills"
+fi
 
 if [[ -d "$SCRIPTS_SRC" ]]; then
   cp -r "$SCRIPTS_SRC" "$(dirname "$DEST")/scripts"

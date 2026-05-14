@@ -1418,6 +1418,27 @@ cmd_skills() {
           "# Paso 7 — completar",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
           "ark tasks complete \"$TASK_ID\" --confidence 1.0"
+        ],
+        batch_preventiva_mail: [
+          "# Paso 1 — detectar que la tarea es de tipo hospital_preventiva_batch_mail",
+          "ark tasks list --status queued --limit 1 | jq -r \".data[0].task_type\"",
+          "# Paso 2 — tomar la tarea",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:claim\"",
+          "ark tasks claim \"$TASK_ID\"",
+          "# Paso 3 — ejecutar el script (NO hacer esto manualmente)",
+          "RESULT=$(ark audit send-preventiva-mail \"$TASK_ID\")",
+          "# Paso 4 — leer stdout para obtener los datos del correo",
+          "EMAIL=$(echo $RESULT | jq -r \".email_destino\")",
+          "PAGADOR=$(echo $RESULT | jq -r \".pagador_nombre\")",
+          "N=$(echo $RESULT | jq -r \".total_facturas\")",
+          "STORAGE=$(echo $RESULT | jq -r \".storage_path\")",
+          "# Paso 5 — enviar correo vía GOG con el Excel adjunto",
+          "# (el agente construye el asunto y cuerpo con los campos del stdout)",
+          "# Paso 6 — actualizar contexto",
+          "ark tasks context-set \"$TASK_ID\" --set reply_sent=true --set sent_at=\"<iso>\"",
+          "# Paso 7 — completar",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
+          "ark tasks complete \"$TASK_ID\" --confidence 1.0"
         ]
       },
       exit_codes: {
@@ -1469,7 +1490,8 @@ cmd_skills() {
         "eps_audit":           "Audita factura médica en 3 capas. Usar workflow execute_queued_task.",
         "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
         "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
-        "batch-denial-mail":   "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail."
+        "batch-denial-mail":              "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail.",
+        "hospital_preventiva_batch_mail": "DELEGAR a ark audit send-preventiva-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_preventiva_mail."
       },
       audit_subcommand: {
         usage:       "ark audit <operacion> [args...]",
@@ -1481,7 +1503,7 @@ cmd_skills() {
             env_required: ["SUPABASE_URL","SUPABASE_SERVICE_KEY"],
             env_optional: ["SUPABASE_STORAGE_BUCKET (default: task-outputs)","ARK_API_URL","ARK_API_KEY"],
             exit_codes: {
-              "0": "Excel generado y subido — stdout incluye storage_path, email_destino, prestador_nombre, total_items_glosados",
+              "0": "Excel generado y subido — stdout incluye storage_path, local_path, email_destino, prestador_nombre, total_items_glosados",
               "1": "Error recuperable (API, storage) — marcar tarea como blocked",
               "2": "Argumento inválido o tarea no encontrada — no reintentar"
             },
@@ -1490,9 +1512,31 @@ cmd_skills() {
               batch_task_id:        "<uuid>",
               excel_filename:       "devoluciones_<nit>_<fecha>.xlsx",
               storage_path:         "storage://task-outputs/denial-mails/<filename>",
+              local_path:           "/tmp/devoluciones_<nit>_<fecha>.xlsx",
               total_items_glosados: "<number>",
               email_destino:        "<email>",
               prestador_nombre:     "<nombre>"
+            }
+          },
+          "send-preventiva-mail": {
+            usage:        "ark audit send-preventiva-mail <batch_task_id>",
+            description:  "Genera el Excel consolidado de facturas radicadas preventiva y lo sube a Supabase Storage. El agente es responsable de enviar el correo vía GOG después.",
+            env_required: ["SUPABASE_URL","SUPABASE_SERVICE_KEY"],
+            env_optional: ["SUPABASE_STORAGE_BUCKET (default: task-outputs)","ARK_API_URL","ARK_API_KEY"],
+            exit_codes: {
+              "0": "Excel generado y subido — stdout incluye storage_path, local_path, email_destino, pagador_nombre, total_facturas",
+              "1": "Error recuperable (API, storage) — marcar tarea como blocked",
+              "2": "Argumento inválido o tarea no encontrada — no reintentar"
+            },
+            stdout_on_success: {
+              ok:             true,
+              batch_task_id:  "<uuid>",
+              excel_filename: "Radicacion_<nit>_<fecha>.xlsx",
+              storage_path:   "storage://task-outputs/preventiva-mails/<filename>",
+              local_path:     "/tmp/Radicacion_<nit>_<fecha>.xlsx",
+              total_facturas: "<number>",
+              email_destino:  "<email>",
+              pagador_nombre: "<nombre>"
             }
           }
         }
