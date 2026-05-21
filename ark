@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARK_VERSION="0.3.3"
+ARK_VERSION="0.3.5"
 ARK_CONFIG_FILE="${HOME}/.config/ark/config"
 ARK_DEFAULT_API_URL="http://localhost:3000"
 ARK_DEFAULT_LIMIT="20"
