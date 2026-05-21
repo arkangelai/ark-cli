@@ -1147,9 +1147,26 @@ cmd_tasks_documents_url() {
 
 # ─── knowledge files list ──────────────────────────────────────────────────────
 cmd_knowledge_files_list() {
-  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "/api/audit/knowledge/files"; return; }
+  local task_type="audit"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --task-type=*) task_type="${1#--task-type=}" ;;
+      --task-type)   shift; task_type="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]"; exit 2 ;;
+    esac; shift || true
+  done
 
-  http_request "GET" "/api/audit/knowledge/files"
+  local endpoint
+  case "$task_type" in
+    audit)               endpoint="/api/audit/knowledge/files" ;;
+    hospital_devolucion) endpoint="/api/hospitales/devolucion/knowledge/files" ;;
+    hospital_preventiva) endpoint="/api/hospitales/preventiva/knowledge" ;;
+    *) err_json "bad_argument" "Unknown task_type: ${task_type}" "false" "{}" "ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]"; exit 2 ;;
+  esac
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "$endpoint"; return; }
+
+  http_request "GET" "$endpoint"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
   local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
@@ -1173,36 +1190,59 @@ cmd_knowledge_files_list() {
 # ─── knowledge files url (download) ────────────────────────────────────────────
 cmd_knowledge_files_url() {
   local path="${1:-}" name="${2:-}"; shift 2 || true
-  [[ -z "$path" || -z "$name" ]] && { err_json "bad_argument" "path and name are required" "false" "{}" "ark knowledge files url <path> <name> [--output=<local-path>]"; exit 2; }
+  [[ -z "$path" || -z "$name" ]] && { err_json "bad_argument" "path and name are required" "false" "{}" "ark knowledge files url <path> <name> [--task-type=audit|hospital_devolucion] [--output=<local-path>]"; exit 2; }
 
-  local output_path=""
+  local output_path="" task_type="audit"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --output=*) output_path="${1#--output=}" ;;
-      --output)   shift; output_path="$1" ;;
+      --output=*)    output_path="${1#--output=}" ;;
+      --output)      shift; output_path="$1" ;;
+      --task-type=*) task_type="${1#--task-type=}" ;;
+      --task-type)   shift; task_type="$1" ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
   [[ -z "$output_path" ]] && output_path="./${name}"
 
+  case "$task_type" in
+    audit|hospital_devolucion) ;;
+    hospital_preventiva) err_json "bad_argument" "hospital_preventiva: knowledge no disponible (stub)" "false" "{}" ""; exit 2 ;;
+    *) err_json "bad_argument" "Unknown task_type: ${task_type}" "false" "{}" "ark knowledge files url <path> <name> [--task-type=audit|hospital_devolucion]"; exit 2 ;;
+  esac
+
   if [[ "$DRY_RUN" == "true" ]]; then
-    dry_run_response "GET" "/api/audit/knowledge/files/url?path=${path}&name=${name}"
+    case "$task_type" in
+      audit)               dry_run_response "GET" "/api/audit/knowledge/files/url?path=${path}&name=${name}" ;;
+      hospital_devolucion) dry_run_response "GET" "/api/hospitales/devolucion/knowledge/files (search ${path}/${name})" ;;
+    esac
     return
   fi
 
-  local encoded_path encoded_name
-  encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
-  encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
+  local signed_url="" expires_at="" storage_path=""
+  case "$task_type" in
+    audit)
+      local encoded_path encoded_name
+      encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+      encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
+      http_request "GET" "/api/audit/knowledge/files/url?path=${encoded_path}&name=${encoded_name}"
+      [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+      signed_url=$(printf '%s' "$HTTP_BODY" | jq -r '.data.url // empty')
+      expires_at=$(printf '%s' "$HTTP_BODY" | jq -r '.data.expires_at // empty')
+      storage_path=$(printf '%s' "$HTTP_BODY" | jq -r '.data.path // empty')
+      ;;
+    hospital_devolucion)
+      http_request "GET" "/api/hospitales/devolucion/knowledge/files"
+      [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+      signed_url=$(printf '%s' "$HTTP_BODY" | jq -r --arg fp "${path}/${name}" '
+        .data | to_entries[] | .value |
+        if type == "array" then .[]
+        else to_entries[] | .value[] end |
+        select(.path == $fp) | .url // empty' | head -1)
+      storage_path="${path}/${name}"
+      ;;
+  esac
 
-  http_request "GET" "/api/audit/knowledge/files/url?path=${encoded_path}&name=${encoded_name}"
-  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
-
-  local signed_url expires_at storage_path
-  signed_url=$(printf '%s' "$HTTP_BODY" | jq -r '.data.url // empty')
-  expires_at=$(printf '%s' "$HTTP_BODY" | jq -r '.data.expires_at // empty')
-  storage_path=$(printf '%s' "$HTTP_BODY" | jq -r '.data.path // empty')
-
-  [[ -z "$signed_url" ]] && { err_json "storage_error" "No signed URL returned" "false" "{}" ""; exit 1; }
+  [[ -z "$signed_url" ]] && { err_json "storage_error" "No signed URL returned for ${path}/${name}" "false" "{}" ""; exit 1; }
 
   local dl_exit=0
   set +e
@@ -1680,9 +1720,16 @@ AUDIT
     On success: prints stdout of the script.
 
 KNOWLEDGE
-  ark knowledge files list           List all knowledge base files with signed URLs
-  ark knowledge files url <path> <name>  Download a knowledge base file
-    [--output=<local-path>]          Default: ./<name>
+  ark knowledge files list [--task-type=<tipo>]
+                                     Lista archivos del knowledge según el tipo de tarea.
+    --task-type=audit                /api/audit/knowledge/files (default)
+    --task-type=hospital_devolucion  /api/hospitales/devolucion/knowledge/files
+    --task-type=hospital_preventiva  /api/hospitales/preventiva/knowledge (stub, retorna [])
+  ark knowledge files url <path> <name> [--task-type=audit|hospital_devolucion] [--output=<path>]
+                                     Descarga un archivo del knowledge base.
+    audit: llama a /files/url para obtener URL fresca.
+    hospital_devolucion: busca la URL firmada en el list response (no hay endpoint /files/url).
+    hospital_preventiva: no soportado (stub).
   ark knowledge upload <file>        Upload a file to the knowledge base
     --folder=<administrativo|medico|financiero|plantillas>
     [--subfolder=<subfolder>]  [--description=<desc>]

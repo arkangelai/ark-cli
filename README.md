@@ -217,8 +217,8 @@ ark tasks comments delete <id> <comment-id>
 ark tasks outputs list <id>
 ark tasks outputs submit <id>  --type=json|text|file|screenshot --label= [--data=] [--storage-path=] [--size=]
 ark tasks outputs get <id> <output-id>
-ark knowledge files list
-ark knowledge files url <path> <name>   [--output=<local-path>]
+ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]
+ark knowledge files url <path> <name>   [--task-type=audit] [--output=<local-path>]
 ark knowledge upload <file>    --folder= [--subfolder=] [--description=]
 ark auth status
 ark config set <key> <value>

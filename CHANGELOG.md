@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.5] — 2026-05-21
+
+### Changed
+- `ark knowledge files list` — agrega `--task-type=audit|hospital_devolucion|hospital_preventiva`
+  (default: `audit`). Ruta al endpoint correcto según el dominio de la tarea:
+  `audit` → `/api/audit/knowledge/files`,
+  `hospital_devolucion` → `/api/hospitales/devolucion/knowledge/files`,
+  `hospital_preventiva` → `/api/hospitales/preventiva/knowledge` (stub, retorna `[]`).
+- `ark knowledge files url` — agrega `--task-type` (default: `audit`). Solo soporta `audit`;
+  los demás tipos retornan error descriptivo (`hospital_devolucion` embebe las URLs en el
+  list response; `hospital_preventiva` es stub).
+
+---
+
 ## [0.3.4] — 2026-05-14
 
 ### Added

@@ -225,23 +225,29 @@ ark tasks create \
 
 ### Workflow 3 — Access the Knowledge Base
 
-Use this before executing audit tasks that require clinical guidelines, administrative rules, or billing tariffs.
+Use `--task-type` to get the correct knowledge files for the task you are executing.
 
 ```bash
-# List all available files (returns signed URLs + metadata organized by category)
-ark knowledge files list | jq '.data'
+# List files — pass the task_type that matches your current task
+ark knowledge files list --task-type=audit               | jq '.data'
+ark knowledge files list --task-type=hospital_devolucion | jq '.data'
+ark knowledge files list --task-type=hospital_preventiva | jq '.data'
+```
 
-# Download a specific file to a local path
+**audit** — `files/url` endpoint exists; use it to refresh expired signed URLs:
+```bash
+# Download a specific file to a local path (audit only)
 ark knowledge files url plantillas informe-template.docx --output /tmp/informe-template.docx
 
-# Download a file from a subfolder
+# Download a file from a subfolder (audit only)
 ark knowledge files url medico/guias-clinicas guia-hipertension.pdf --output /tmp/guia.pdf
 
-# The response includes where the file was saved
 # { "url": "...", "expires_at": "...", "path": "...", "local_path": "/tmp/guia.pdf", "size_bytes": 245120 }
 ```
 
-The signed URL in the list response expires in ~1 hour. If it may have expired, use `ark knowledge files url` to get a fresh one and re-download.
+**hospital_devolucion** — signed URLs are embedded in the `list` response (TTL ~1h). Re-run `list` if expired.
+
+**hospital_preventiva** — knowledge stub; `list` returns `[]`.
 
 ### Workflow 4 — Signal a Blocker
 
