@@ -66,6 +66,7 @@ the message to the user. Exit code `6` means the install prefix is not writable.
 |---|---|
 | `general` | Razona y ejecuta con instrucciones en `context` |
 | `eps_audit` | Audita factura médica en 3 capas |
+| `audit_soat` | Audita factura SOAT |
 | `batch-denial-mail` | Delega a `ark audit send-denial-mail` — no razonar |
 
 ---

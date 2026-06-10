@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARK_VERSION="0.3.5"
+ARK_VERSION="0.4.0"
 ARK_CONFIG_FILE="${HOME}/.config/ark/config"
 ARK_DEFAULT_API_URL="http://localhost:3000"
 ARK_DEFAULT_LIMIT="20"
@@ -1530,6 +1530,7 @@ cmd_skills() {
         "eps_audit":           "Audita factura médica en 3 capas. Usar workflow execute_queued_task.",
         "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
         "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
+        "audit_soat":          "Audita factura SOAT. Usar workflow execute_queued_task.",
         "hospital_devolucion_batch":      "Lote de glosas (Excel/CSV). Procesado por hospital-devolucion-batch-parse, que crea una task hospital_devolucion por glosa.",
         "batch-denial-mail":              "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail.",
         "hospital_preventiva_batch_mail": "DELEGAR a ark audit send-preventiva-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_preventiva_mail."
@@ -1666,7 +1667,7 @@ TASKS
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
-    [--context=<json>]  [--status=queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|batch-denial-mail|hospital_preventiva_batch_mail]
+    [--context=<json>]  [--status=queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|batch-denial-mail|hospital_preventiva_batch_mail]
   ark tasks update <id>              Set workspace log path (agent only)
     --log-path=<storage-path>
   ark tasks context <id>             Set or clear the task context (human only)

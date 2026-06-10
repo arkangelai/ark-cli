@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.0] — 2026-06-10
+
+### Added
+- `audit_soat` — nuevo task type para auditoría de facturas SOAT.
+  Tarea de razonamiento simple: el agente lee el `context` y audita usando Workflow 1 (`execute_queued_task`).
+  Listado en `ark skills`, `ark tasks create --type`, `README.md` y `skills/SKILL.md`.
+
+---
+
 ## [0.3.5] — 2026-05-21
 
 ### Changed

@@ -262,6 +262,7 @@ Upgrade to 0.2.5+ if you hit "Argument list too long" errors.
 |---|---|---|
 | `general` | `skills/SKILL.md` — Workflow 1 | Agent reasons and executes |
 | `eps_audit` | `skills/SKILL.md` — Workflow 1 | Agent audits medical invoice in 3 layers |
+| `audit_soat` | `skills/SKILL.md` — Workflow 1 | Agent audits SOAT invoice |
 | `hospital_preventiva` | `skills/SKILL.md` — Workflow 1 | Agent audits preventive hospital invoice |
 | `hospital_devolucion` | `skills/SKILL.md` — Workflow 1 | Agent audits hospital return |
 | `batch-denial-mail` | `skills/batch-denial-mail.md` | Script-only — no LLM reasoning over content |
