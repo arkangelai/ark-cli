@@ -6,7 +6,7 @@ description: >
   and completing with a confidence score. Also handles blockers, follow-on task
   creation, and re-execution after human feedback. Use when you are an agent that
   needs to pick up and execute tasks from the queue.
-version: "1.3"
+version: "1.4"
 compatibility: Requires ark CLI installed and configured with a valid api-key and url.
 ---
 
@@ -71,7 +71,7 @@ the message to the user. Exit code `6` means the install prefix is not writable.
 
 ---
 
-## Workflow 7 — Ejecutar una tarea batch-denial-mail
+## Workflow 9 — Ejecutar una tarea batch-denial-mail
 
 Este workflow se aplica cuando `.data[0].task_type` es `batch-denial-mail`. El agente no razona sobre el contenido — solo ejecuta el script y reporta el resultado.
 
@@ -540,6 +540,87 @@ Read from the response:
 Only records that were uploaded (and therefore have a `storage_path`) can be
 fetched this way. A reference-only input registered with `inputs add` will
 return `no_stored_file` — read it from its original path instead.
+
+---
+
+## Workflow 7 — Use the Learnings Base
+
+Before starting execution, check if prior learnings exist for this type of work.
+After completing a task, contribute new reusable insights.
+
+### Reading learnings
+
+```bash
+# List all learnings
+ark learnings files list
+
+# Filter by type
+ark learnings files list --type=operacional
+ark learnings files list --type=negocio
+
+# Download a specific learning
+ark learnings files url operacional audit-pattern-eps.md --output /tmp/audit-pattern.md
+```
+
+Read from the response:
+- For `files list`: `.data` contains files organized by type, each with `name`, `size`, and optionally `url`.
+- For `files url`: the file is downloaded to `--output` path (default: `./<name>`). Response includes `url`, `expires_at`, `path`, `local_path`, `size_bytes`.
+
+### Contributing a learning
+
+When you discover a reusable pattern, insight, or operational knowledge during
+task execution, request an upload URL:
+
+```bash
+ark learnings upload \
+  --filename=eps-audit-pattern-duplicate-billing.md \
+  --size=3072 \
+  --mime=text/markdown \
+  --type=operacional
+```
+
+Read from the response:
+- `.data.upload_url` — use this to PUT the file content.
+- `.data.path` — where the learning will be stored.
+
+Types:
+- `operacional` — execution patterns, common errors, workarounds, audit heuristics.
+- `negocio` — domain rules, regulatory insights, business logic discoveries.
+
+---
+
+## Workflow 8 — Agent Health and Heartbeat
+
+Agents running in a loop must send periodic heartbeats. Use `agents status` to
+check health before starting work.
+
+### Check agent health
+
+```bash
+ark agents status
+```
+
+Read from the response:
+- `.data.status` — overall agent health (`active`, `idle`, `stale`).
+- `.data.last_heartbeat_at` — when the last heartbeat was received.
+- `.data.loop_running` — whether an agent loop is currently active.
+
+### Send a heartbeat
+
+```bash
+ark agents heartbeat --agent-id "$AGENT_ID"
+```
+
+With diagnostics:
+
+```bash
+ark agents heartbeat --agent-id "$AGENT_ID" \
+  --metadata '{"cpu_percent":45,"memory_mb":512,"tasks_completed":3,"current_task":"'"$TASK_ID"'"}'
+```
+
+Send heartbeats at regular intervals (every 60–120 seconds) during long-running
+task execution. If heartbeats stop, the system may consider the agent stale and
+re-queue its in-progress tasks.
 
 ---
 

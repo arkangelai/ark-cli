@@ -31,7 +31,7 @@ Every successful command outputs this shape to stdout:
 ```json
 {
   "ok": true,
-  "cli_version": "0.3.2",
+  "cli_version": "0.5.0",
   "data": { },
   "_links": { },
   "next_commands": {
@@ -53,7 +53,7 @@ Error envelope goes to **stderr**:
 ```json
 {
   "ok": false,
-  "cli_version": "0.3.2",
+  "cli_version": "0.5.0",
   "error": {
     "code": "invalid_status_transition",
     "message": "Cannot transition from 'in_progress' to 'draft'",
@@ -145,6 +145,11 @@ Use these to read and mutate task state:
 | `ark tasks comments post <id>` | Post a note or blocker comment |
 | `ark tasks inputs list <id>` | List task inputs |
 | `ark tasks create` | Create a follow-on task |
+| `ark learnings files list` | List learnings (operacional, negocio) |
+| `ark learnings files url <path> <name>` | Download a learning file (signed URL) |
+| `ark learnings upload` | Request upload URL for a learning (agent) |
+| `ark agents status` | Agent health snapshot (status, heartbeat, loop) |
+| `ark agents heartbeat --agent-id` | Send periodic heartbeat with diagnostics |
 
 > **WARNING — human-only commands.**
 > `ark tasks context <id> --data '<json>'` and `ark tasks context <id> --clear`
@@ -292,7 +297,54 @@ export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
 ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 ```
 
-### Workflow 6 — Ejecutar una tarea batch-denial-mail
+### Workflow 6 — Learnings (list, download, upload)
+
+Agents can read and contribute to the organizational learning base.
+
+```bash
+# List all learnings
+ark learnings files list
+
+# List by type
+ark learnings files list --type=operacional
+ark learnings files list --type=negocio
+
+# Download a specific learning file
+ark learnings files url operacional insight-name.md --output /tmp/insight.md
+
+# Request an upload URL for a new learning (agent submits findings)
+ark learnings upload \
+  --filename=pattern-detected.md \
+  --size=2048 \
+  --mime=text/markdown \
+  --type=operacional
+```
+
+Use learnings to check for prior knowledge before starting work, and to
+persist reusable insights after completing a task.
+
+### Workflow 7 — Agent Health (status, heartbeat)
+
+Agents running in a loop should send periodic heartbeats and can check
+the health of other agents.
+
+```bash
+# Check agent health snapshot
+ark agents status
+
+# Send a heartbeat (required in agent loops)
+ark agents heartbeat --agent-id "$AGENT_ID"
+
+# Heartbeat with diagnostics metadata
+ark agents heartbeat --agent-id "$AGENT_ID" \
+  --metadata '{"cpu_percent":45,"memory_mb":512,"tasks_completed":3}'
+```
+
+The heartbeat keeps the system aware that the agent is alive. If
+heartbeats stop, the agent is considered stale and its in-progress
+tasks may be re-queued.
+
+### Workflow 8 — Ejecutar una tarea batch-denial-mail
 
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)

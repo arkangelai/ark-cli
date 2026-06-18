@@ -220,6 +220,11 @@ ark tasks outputs get <id> <output-id>
 ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]
 ark knowledge files url <path> <name>   [--task-type=audit] [--output=<local-path>]
 ark knowledge upload <file>    --folder= [--subfolder=] [--description=]
+ark learnings files list       [--type=operacional|negocio]
+ark learnings files url <path> <name>   [--output=<local-path>]
+ark learnings upload           --filename= --size= --mime= --type=operacional|negocio
+ark agents status
+ark agents heartbeat           --agent-id= [--metadata=<json>]
 ark auth status
 ark config set <key> <value>
 ark config get <key>
@@ -267,3 +272,10 @@ Upgrade to 0.2.5+ if you hit "Argument list too long" errors.
 | `hospital_devolucion` | `skills/SKILL.md` — Workflow 1 | Agent audits hospital return |
 | `batch-denial-mail` | `skills/batch-denial-mail.md` | Script-only — no LLM reasoning over content |
 | `hospital_preventiva_batch_mail` | `skills/hospital-preventiva-batch-mail.md` | Script-only — no LLM reasoning over content |
+
+### Cross-cutting capabilities
+
+| Capability | Commands | When to use |
+|---|---|---|
+| Learnings | `ark learnings files list`, `ark learnings files url`, `ark learnings upload` | Read prior knowledge before execution; contribute insights after |
+| Agent health | `ark agents status`, `ark agents heartbeat` | Monitor agent health; send heartbeats in agent loops |

@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.5.0] — 2026-06-18
+
+### Added
+- **Learnings API** — 3 nuevos comandos para gestionar la base de aprendizajes:
+  - `ark learnings files list [--type=operacional|negocio]` — lista archivos de aprendizajes
+    con filtro opcional por tipo. Endpoint: `GET /api/learnings/knowledge/files`.
+  - `ark learnings files url <path> <name> [--output=<path>]` — descarga un archivo de
+    aprendizaje vía URL firmada. Endpoint: `GET /api/learnings/knowledge/files/url`.
+  - `ark learnings upload --filename= --size= --mime= --type=` — solicita URL de carga
+    para un aprendizaje (uso de agente). Endpoint: `POST /api/learnings/knowledge/upload`.
+- **Agents API** — 2 nuevos comandos para monitoreo de agentes:
+  - `ark agents status` — snapshot de salud de agentes (status, last_heartbeat_at,
+    loop_running). Endpoint: `GET /api/agents/status`.
+  - `ark agents heartbeat --agent-id= [--metadata=<json>]` — envía heartbeat periódico
+    con diagnósticos opcionales. Endpoint: `POST /api/agents/heartbeat`.
+- `ark skills` — nuevos workflows: `learnings_list`, `learnings_download`,
+  `learnings_upload`, `agents_health`, `agents_heartbeat`.
+- `AGENTS.md` — tabla de comandos actualizada con los 5 nuevos comandos.
+
+---
+
 ## [0.4.0] — 2026-06-10
 
 ### Added

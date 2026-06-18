@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARK_VERSION="0.4.0"
+ARK_VERSION="0.5.0"
 ARK_CONFIG_FILE="${HOME}/.config/ark/config"
 ARK_DEFAULT_API_URL="http://localhost:3000"
 ARK_DEFAULT_LIMIT="20"
@@ -1317,6 +1317,200 @@ cmd_knowledge_upload() {
   ok_response "$data" "{}" "{}"
 }
 
+# ─── learnings files list ──────────────────────────────────────────────────────
+cmd_learnings_files_list() {
+  local learning_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type=*) learning_type="${1#--type=}" ;;
+      --type)   shift; learning_type="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark learnings files list [--type=operacional|negocio]"; exit 2 ;;
+    esac; shift || true
+  done
+
+  local endpoint="/api/learnings/knowledge/files"
+  [[ -n "$learning_type" ]] && endpoint="${endpoint}?type=${learning_type}"
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "$endpoint"; return; }
+
+  http_request "GET" "$endpoint"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r '
+      if type == "array" then
+        .[] | "\(.name) (\(.size // "?") bytes)"
+      elif type == "object" then
+        to_entries[] |
+        .key as $cat |
+        (if (.value | type) == "array" then
+          .value[] | "[\($cat)] \(.name) (\(.size // "?") bytes)"
+        else
+          .value | to_entries[] |
+          .key as $sub |
+          .value[] | "[\($cat)/\($sub)] \(.name) (\(.size // "?") bytes)"
+        end)
+      else empty end'
+    return
+  fi
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── learnings files url (download) ───────────────────────────────────────────
+cmd_learnings_files_url() {
+  local path="${1:-}" name="${2:-}"; shift 2 || true
+  [[ -z "$path" || -z "$name" ]] && { err_json "bad_argument" "path and name are required" "false" "{}" "ark learnings files url <path> <name> [--output=<local-path>]"; exit 2; }
+
+  local output_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output=*) output_path="${1#--output=}" ;;
+      --output)   shift; output_path="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+  [[ -z "$output_path" ]] && output_path="./${name}"
+
+  local encoded_path encoded_name
+  encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+  encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "/api/learnings/knowledge/files/url?path=${path}&name=${name}"; return; }
+
+  http_request "GET" "/api/learnings/knowledge/files/url?path=${encoded_path}&name=${encoded_name}"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local signed_url expires_at storage_path
+  signed_url=$(printf '%s' "$HTTP_BODY" | jq -r '.data.url // empty')
+  expires_at=$(printf '%s' "$HTTP_BODY" | jq -r '.data.expires_at // empty')
+  storage_path=$(printf '%s' "$HTTP_BODY" | jq -r '.data.path // empty')
+
+  [[ -z "$signed_url" ]] && { err_json "storage_error" "No signed URL returned for ${path}/${name}" "false" "{}" ""; exit 1; }
+
+  local dl_exit=0
+  set +e
+  curl --silent --show-error --location --output "$output_path" "$signed_url"
+  dl_exit=$?
+  set -e
+
+  if [[ $dl_exit -ne 0 ]]; then
+    err_json "network_error" "Download failed (curl exit ${dl_exit})" "true" "{}" ""
+    exit 1
+  fi
+
+  local size_bytes; size_bytes=$(file_size_bytes "$output_path" 2>/dev/null || echo 0)
+  local local_path; local_path=$(abs_path "$output_path")
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf 'Downloaded: %s (%s bytes)\n' "$local_path" "$size_bytes"
+    return
+  fi
+
+  ok_response "$(jq -n \
+    --arg url "$signed_url" --arg exp "$expires_at" \
+    --arg sp "$storage_path" --arg lp "$local_path" --arg sz "$size_bytes" \
+    '{url:$url,expires_at:$exp,path:$sp,local_path:$lp,size_bytes:$sz}')" "{}" "{}"
+}
+
+# ─── learnings upload ─────────────────────────────────────────────────────────
+cmd_learnings_upload() {
+  local filename="" size_bytes="" mime_type="" learning_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filename=*)  filename="${1#--filename=}" ;;
+      --filename)    shift; filename="$1" ;;
+      --size=*)      size_bytes="${1#--size=}" ;;
+      --size)        shift; size_bytes="$1" ;;
+      --mime=*)      mime_type="${1#--mime=}" ;;
+      --mime)        shift; mime_type="$1" ;;
+      --type=*)      learning_type="${1#--type=}" ;;
+      --type)        shift; learning_type="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark learnings upload --filename=<name> --size=<bytes> --mime=<type> --type=operacional|negocio"; exit 2 ;;
+    esac; shift || true
+  done
+
+  [[ -z "$filename" ]] && { err_json "bad_argument" "--filename is required" "false" "{}" "ark learnings upload --filename=<name> --size=<bytes> --mime=<type> --type=operacional|negocio"; exit 2; }
+  [[ -z "$size_bytes" ]] && { err_json "bad_argument" "--size is required (bytes)" "false" "{}" ""; exit 2; }
+  [[ -z "$mime_type" ]] && { err_json "bad_argument" "--mime is required" "false" "{}" ""; exit 2; }
+  [[ -z "$learning_type" ]] && { err_json "bad_argument" "--type is required (operacional|negocio)" "false" "{}" ""; exit 2; }
+
+  local body
+  body=$(jq -n \
+    --arg fn "$filename" --argjson sz "$size_bytes" \
+    --arg mt "$mime_type" --arg lt "$learning_type" \
+    '{filename:$fn,size_bytes:$sz,mime_type:$mt,type:$lt}')
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_run_response "POST" "/api/learnings/knowledge/upload" "$body"
+    return
+  fi
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/learnings/knowledge/upload" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── agents status ────────────────────────────────────────────────────────────
+cmd_agents_status() {
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "/api/agents/status"; return; }
+
+  http_request "GET" "/api/agents/status"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r '
+      if type == "array" then
+        .[] | "[\(.agent_id // .id // "?")] status=\(.status // "?") last_heartbeat=\(.last_heartbeat_at // "never") loop=\(.loop_running // false)"
+      elif type == "object" then
+        "status=\(.status // "?") last_claimed=\(.last_claimed_at // "never") last_heartbeat=\(.last_heartbeat_at // "never") loop=\(.loop_running // false)"
+      else . end'
+    return
+  fi
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── agents heartbeat ────────────────────────────────────────────────────────
+cmd_agents_heartbeat() {
+  local agent_id="" metadata=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agent-id=*) agent_id="${1#--agent-id=}" ;;
+      --agent-id)   shift; agent_id="$1" ;;
+      --metadata=*) metadata="${1#--metadata=}" ;;
+      --metadata)   shift; metadata="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark agents heartbeat --agent-id=<id> [--metadata=<json>]"; exit 2 ;;
+    esac; shift || true
+  done
+
+  [[ -z "$agent_id" ]] && { err_json "bad_argument" "--agent-id is required" "false" "{}" "ark agents heartbeat --agent-id=<id> [--metadata=<json>]"; exit 2; }
+
+  local body
+  if [[ -n "$metadata" ]]; then
+    body=$(jq -n --arg id "$agent_id" --argjson meta "$metadata" '{agent_id:$id,metadata:$meta}')
+  else
+    body=$(jq -n --arg id "$agent_id" '{agent_id:$id}')
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_run_response "POST" "/api/agents/heartbeat" "$body"
+    return
+  fi
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/agents/heartbeat" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
 # ─── audit ─────────────────────────────────────────────────────────────────────
 cmd_audit() {
   local operacion="${1:-}"; shift || true
@@ -1458,6 +1652,24 @@ cmd_skills() {
           "# Paso 7 — completar",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
           "ark tasks complete \"$TASK_ID\" --confidence 1.0"
+        ],
+        learnings_list: [
+          "ark learnings files list",
+          "ark learnings files list --type=operacional",
+          "ark learnings files list --type=negocio"
+        ],
+        learnings_download: [
+          "ark learnings files url <path> <name> --output ./learning.md"
+        ],
+        learnings_upload: [
+          "ark learnings upload --filename=insight.md --size=2048 --mime=text/markdown --type=operacional"
+        ],
+        agents_health: [
+          "ark agents status"
+        ],
+        agents_heartbeat: [
+          "ark agents heartbeat --agent-id \"$AGENT_ID\"",
+          "ark agents heartbeat --agent-id \"$AGENT_ID\" --metadata '{\"cpu\":45,\"memory_mb\":512}'"
         ],
         batch_preventiva_mail: [
           "# Paso 1 — detectar que la tarea es de tipo hospital_preventiva_batch_mail",
@@ -1720,6 +1932,19 @@ AUDIT
     On error (exit != 0): prints stderr for harness blocking notes.
     On success: prints stdout of the script.
 
+LEARNINGS
+  ark learnings files list [--type=operacional|negocio]
+                                     Lista archivos de aprendizajes del knowledge base.
+  ark learnings files url <path> <name> [--output=<path>]
+                                     Descarga un archivo de aprendizaje (URL firmada).
+  ark learnings upload               Solicita URL de carga para un aprendizaje (agente)
+    --filename=<name>  --size=<bytes>  --mime=<mime-type>  --type=operacional|negocio
+
+AGENTS
+  ark agents status                  Snapshot de salud de agentes (status, heartbeat, loop)
+  ark agents heartbeat               Envía heartbeat periódico con diagnósticos
+    --agent-id=<id>  [--metadata=<json>]
+
 KNOWLEDGE
   ark knowledge files list [--task-type=<tipo>]
                                      Lista archivos del knowledge según el tipo de tarea.
@@ -1847,6 +2072,26 @@ main() {
           esac ;;
         upload) cmd_knowledge_upload "$@" ;;
         *) err_json "bad_argument" "Unknown knowledge subcommand: ${sub}" "false" "{}" "ark knowledge files|upload"; exit 2 ;;
+      esac ;;
+    learnings)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        files)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            list) cmd_learnings_files_list "$@" ;;
+            url)  cmd_learnings_files_url "$@" ;;
+            *) err_json "bad_argument" "Unknown files subcommand: ${sub2}" "false" "{}" "ark learnings files list|url"; exit 2 ;;
+          esac ;;
+        upload) cmd_learnings_upload "$@" ;;
+        *) err_json "bad_argument" "Unknown learnings subcommand: ${sub}" "false" "{}" "ark learnings files|upload"; exit 2 ;;
+      esac ;;
+    agents)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        status)    cmd_agents_status "$@" ;;
+        heartbeat) cmd_agents_heartbeat "$@" ;;
+        *) err_json "bad_argument" "Unknown agents subcommand: ${sub}" "false" "{}" "ark agents status|heartbeat"; exit 2 ;;
       esac ;;
     audit)    cmd_audit "$@" ;;
     skills)   cmd_skills ;;
