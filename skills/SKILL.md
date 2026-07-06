@@ -69,6 +69,7 @@ the message to the user. Exit code `6` means the install prefix is not writable.
 | `general` | Razona y ejecuta con instrucciones en `context` |
 | `eps_audit` | Audita factura médica en 3 capas |
 | `audit_soat` | Audita factura SOAT |
+| `soat_glosa_mail` | Comunicación de glosas SOAT |
 | `batch-denial-mail` | Delega a `ark audit send-denial-mail` — no razonar |
 
 ---
@@ -910,9 +911,9 @@ ark tasks inputs list <id>                    What to read
 ark tasks inputs add <id> --path <p> --type   Register a reference-only source
 ark tasks inputs upload <id> <file>           Upload a file as an input (≤ 500 MB)
 ark tasks ingest-dir <dir> --map subdir-as-case --task-type <type> --batch-id <id>
-                                              Bulk-create case tasks and upload inputs
+                                              Bulk-create case tasks and upload inputs (hold requires human key + audit_soat)
 ark tasks release-batch --batch-id <id> --limit <N>
-                                              Release held batch tasks to draft
+                                              Release held batch tasks to draft (human key only)
 ark tasks comments post <id> --type note      Post progress updates
 ark tasks outputs upload <id> <file> --type <t> --label report
                                               Upload the final deliverable (format per task context)
@@ -926,7 +927,7 @@ ark tasks complete <id> --confidence <score>  Close the task
 ark tasks block <id> --reason <reason>        Signal a blocker
 ark tasks comments list <id>                  Read human feedback on re-queue
 ark tasks get <id>                            Fetch current state + next_commands
-ark tasks create --title <t> --type <general|eps_audit>
+ark tasks create --title <t> --type <general|eps_audit|audit_soat|soat_glosa_mail>
                                               Create a task with an explicit type
 ark check                                     Compare CLI fields against live API spec
 ```

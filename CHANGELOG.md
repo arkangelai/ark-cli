@@ -21,6 +21,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Raised the default client-side upload ceiling from 50 MB to 500 MB for task
   inputs, outputs, knowledge uploads, and bulk ingestion. The limit can still be
   overridden with `ARK_MAX_UPLOAD_BYTES` if the backend limit changes.
+- Aligned `ingest-dir` with the Salmona bulk-ingest API on `main`: input batch
+  registration now sends `files[]` with stable `client_ref` values and parses
+  both `created` and `deduped` task rows on retry/resume.
 
 ---
 

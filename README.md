@@ -157,12 +157,16 @@ directories. It creates tasks through `POST /api/tasks/batch`, requests signed
 URLs through `POST /api/tasks/{id}/inputs/batch`, uploads binaries with bounded
 parallelism and retries, and prints the final JSON summary to stdout. Progress
 logs go to stderr. Use `--include` and `--exclude` globs to narrow the file set.
+Creating tasks in `hold` requires a human API key and `--task-type audit_soat`;
+agent API keys must create tasks directly in `queued`.
 
 Once a held batch is ready for OCR/pre-processing, release it gradually:
 
 ```bash
 ark tasks release-batch --batch-id carga-soat-2026-07 --limit 100
 ```
+
+`release-batch` is also human-only; agent keys receive `403 forbidden` by design.
 
 **5. Complete with a confidence score**
 ```bash
@@ -321,6 +325,7 @@ Upgrade to 0.2.5+ if you hit "Argument list too long" errors.
 | `general` | `skills/SKILL.md` — Workflow 1 | Agent reasons and executes |
 | `eps_audit` | `skills/SKILL.md` — Workflow 1 | Agent audits medical invoice in 3 layers |
 | `audit_soat` | `skills/SKILL.md` — Workflow 1 | Agent audits SOAT invoice |
+| `soat_glosa_mail` | `skills/SKILL.md` — Workflow 1 | Agent handles SOAT glosa communication task |
 | `hospital_preventiva` | `skills/SKILL.md` — Workflow 1 | Agent audits preventive hospital invoice |
 | `hospital_devolucion` | `skills/SKILL.md` — Workflow 1 | Agent audits hospital return |
 | `batch-denial-mail` | `skills/batch-denial-mail.md` | Script-only — no LLM reasoning over content |

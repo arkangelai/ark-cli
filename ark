@@ -303,8 +303,13 @@ curl_put_signed_file() {
       return 0
     fi
 
+    local body; body=$(cat "$body_file" 2>/dev/null || true)
+    if [[ "$body" =~ [Aa]lready.exists || "$body" =~ [Dd]uplicate ]]; then
+      rm -f "$body_file"
+      return 0
+    fi
+
     if (( attempt == attempts )); then
-      local body; body=$(cat "$body_file" 2>/dev/null || true)
       rm -f "$body_file"
       printf 'PUT failed for %s (curl=%s http=%s) %s\n' "$file_path" "$curl_exit" "$status" "$body" >&2
       return 1
@@ -1168,7 +1173,7 @@ cmd_tasks_ingest_dir() {
         --arg filename "$base" \
         --arg source "$file_path" \
         --argjson sz "$size" \
-        '{local_path:$lp,filename:$filename,size_bytes:$sz,content_type:"application/octet-stream",source_path:$source}' >> "$input_chunk"
+        '{client_ref:$lp,filename:$filename,size_bytes:$sz,mime_type:"application/octet-stream",description:$source,path_type:"storage"}' >> "$input_chunk"
       input_chunk_count=$((input_chunk_count + 1))
       if [[ "$input_chunk_count" -ge 1000 ]]; then
         cmd_tasks_ingest_dir_prepare_and_upload "$task_id" "$input_chunk" "$task_files" "$upload_results" "$file_concurrency"
@@ -1244,7 +1249,12 @@ cmd_tasks_ingest_dir_create_task_chunk() {
   [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
   printf '%s' "$HTTP_BODY" | jq -r '
-    (.data.tasks // .data.created // .data.results // .data // .tasks // .results // [])[]
+    (if (.data | type) == "object" then
+      ((.data.created // []) + (.data.deduped // []) + (.data.tasks // []) + (.data.results // []))
+    elif (.data | type) == "array" then .data
+    else
+      ((.created // []) + (.deduped // []) + (.tasks // []) + (.results // []))
+    end)[]
     | [(.client_ref // .clientRef // .ref // .external_id // ""), (.task_id // .taskId // .id // .task.id // "")]
     | select(.[0] != "" and .[1] != "")
     | @tsv' >> "$task_map_tsv"
@@ -1255,7 +1265,7 @@ cmd_tasks_ingest_dir_prepare_and_upload() {
   [[ -s "$input_chunk" ]] || return
 
   local body ikey upload_plan
-  body=$(jq -s '{inputs:.}' "$input_chunk")
+  body=$(jq -s '{files:.}' "$input_chunk")
   local chunk_sig; chunk_sig=$(cksum "$input_chunk" | awk '{print $1}')
   ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}:inputs-batch:${task_id}:${chunk_sig}"
   http_request "POST" "/api/tasks/${task_id}/inputs/batch" "$body" "$ikey"
@@ -1264,7 +1274,7 @@ cmd_tasks_ingest_dir_prepare_and_upload() {
   upload_plan=$(mktemp)
   printf '%s' "$HTTP_BODY" | jq -r '
     (.data.inputs // .data.files // .data.uploads // .inputs // .files // .uploads // [])[]
-    | [(.local_path // .localPath // .path // ""), (.upload_url // .uploadUrl // .signed_url // .signedUrl // .url // "")]
+    | [(.client_ref // .clientRef // .local_path // .localPath // .path // ""), (.upload_url // .uploadUrl // .signed_url // .signedUrl // .url // "")]
     | select(.[0] != "" and .[1] != "")
     | @tsv' > "$upload_plan"
 
@@ -1321,7 +1331,7 @@ cmd_tasks_release_batch() {
   done
 
   [[ -n "$batch_id" ]] || { err_json "bad_argument" "--batch-id is required" "false" "{}" "ark tasks release-batch --batch-id <id> --limit <N>"; exit 2; }
-  if [[ -n "$limit" && ! "$limit" =~ ^[0-9]+$ ]]; then
+  if [[ -n "$limit" && (! "$limit" =~ ^[0-9]+$ || "$limit" -le 0) ]]; then
     err_json "bad_argument" "--limit must be a positive integer" "false" "{}" ""; exit 2
   fi
 
@@ -2208,6 +2218,7 @@ cmd_skills() {
         "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
         "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
         "audit_soat":          "Audita factura SOAT. Usar workflow execute_queued_task.",
+        "soat_glosa_mail":     "Comunicación de glosas SOAT. Usar workflow execute_queued_task o flujo específico del lote si aplica.",
         "hospital_devolucion_batch":      "Lote de glosas (Excel/CSV). Procesado por hospital-devolucion-batch-parse, que crea una task hospital_devolucion por glosa.",
         "batch-denial-mail":              "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail.",
         "hospital_preventiva_batch_mail": "DELEGAR a ark audit send-preventiva-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_preventiva_mail."
@@ -2344,7 +2355,7 @@ TASKS
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
-    [--context=<json>]  [--status=hold|draft|queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|batch-denial-mail|hospital_preventiva_batch_mail]
+    [--context=<json>]  [--status=hold|draft|queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|soat_glosa_mail|batch-denial-mail|hospital_preventiva_batch_mail]
   ark tasks update <id>              Set workspace log path (agent only)
     --log-path=<storage-path>
   ark tasks context <id>             Set or clear the task context (human only)
@@ -2366,8 +2377,10 @@ TASKS
     [--status=hold|draft|queued]  [--priority=]  [--concurrency=12]
     [--file-concurrency=12]  [--resume]  [--dry-run]
     [--include=<glob>]  [--exclude=<glob>]
+    Note: status=hold requires a human API key and task_type=audit_soat.
   ark tasks release-batch            Release held tasks in a batch to draft
     --batch-id=<id>  [--limit=<N>]
+    Note: release-batch requires a human API key.
 
 INPUTS
   ark tasks inputs list <id>         List registered input paths
