@@ -235,7 +235,12 @@ http_upload() {
 }
 
 # ─── upload helpers ────────────────────────────────────────────────────────────
-ARK_MAX_UPLOAD_BYTES=$((50 * 1024 * 1024))
+ARK_MAX_UPLOAD_BYTES="${ARK_MAX_UPLOAD_BYTES:-$((500 * 1024 * 1024))}"
+ARK_UPLOAD_RETRY_ATTEMPTS="${ARK_UPLOAD_RETRY_ATTEMPTS:-3}"
+
+upload_limit_mb() {
+  echo $((ARK_MAX_UPLOAD_BYTES / 1024 / 1024))
+}
 
 file_size_bytes() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
@@ -246,6 +251,74 @@ abs_path() {
   if [[ "$p" == /* ]]; then echo "$p"
   else echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
   fi
+}
+
+file_basename() {
+  basename "$1"
+}
+
+is_ignored_bulk_file() {
+  local rel="$1" base="$2"
+  [[ "$base" == ".DS_Store" || "$base" == "Thumbs.db" ]] && return 0
+  [[ "$base" == .* ]] && return 0
+  [[ "$rel" == .* || "$rel" == */.* ]] && return 0
+  return 1
+}
+
+matches_any_glob_file() {
+  local rel="$1" base="$2" glob_file="$3"
+  [[ -f "$glob_file" ]] || return 1
+
+  local pattern
+  while IFS= read -r pattern; do
+    [[ -z "$pattern" ]] && continue
+    if [[ "$rel" == $pattern || "$base" == $pattern ]]; then
+      return 0
+    fi
+  done < "$glob_file"
+
+  return 1
+}
+
+curl_put_signed_file() {
+  local file_path="$1" signed_url="$2" attempts="${3:-$ARK_UPLOAD_RETRY_ATTEMPTS}"
+  local attempt=1 status body_file
+
+  while (( attempt <= attempts )); do
+    body_file=$(mktemp)
+    local curl_exit=0
+    set +e
+    status=$(curl --silent --show-error --location \
+      --write-out "%{http_code}" \
+      --output "$body_file" \
+      -X PUT \
+      -H "Content-Type: application/octet-stream" \
+      --upload-file "$file_path" \
+      "$signed_url")
+    curl_exit=$?
+    set -e
+
+    if [[ $curl_exit -eq 0 && "$status" =~ ^2 ]]; then
+      rm -f "$body_file"
+      return 0
+    fi
+
+    local body; body=$(cat "$body_file" 2>/dev/null || true)
+    if [[ "$body" =~ [Aa]lready.exists || "$body" =~ [Dd]uplicate ]]; then
+      rm -f "$body_file"
+      return 0
+    fi
+
+    if (( attempt == attempts )); then
+      rm -f "$body_file"
+      printf 'PUT failed for %s (curl=%s http=%s) %s\n' "$file_path" "$curl_exit" "$status" "$body" >&2
+      return 1
+    fi
+
+    rm -f "$body_file"
+    sleep $((2 ** (attempt - 1)))
+    attempt=$((attempt + 1))
+  done
 }
 
 # ─── next_commands builder ─────────────────────────────────────────────────────
@@ -859,7 +932,7 @@ cmd_tasks_inputs_upload() {
 
   local size_bytes; size_bytes=$(file_size_bytes "$file_path")
   if [[ -n "$size_bytes" && "$size_bytes" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
-    err_json "payload_too_large" "File exceeds 50MB upload limit" "false" \
+    err_json "payload_too_large" "File exceeds $(upload_limit_mb)MB upload limit" "false" \
       "$(jq -n --argjson sz "$size_bytes" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{size_bytes:$sz,max_bytes:$max}')" \
       "Stage the file to Supabase Storage and use 'ark tasks inputs add --path storage://...' instead"
     exit 2
@@ -883,6 +956,393 @@ cmd_tasks_inputs_upload() {
   [[ -n "$path_type" ]] && fields+=("path_type=${path_type}")
 
   http_upload "POST" "/api/tasks/${id}/inputs/upload" "$ikey" "${fields[@]}"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks ingest-dir ──────────────────────────────────────────────────────────
+cmd_tasks_ingest_dir() {
+  local root_dir="${1:-}"; shift || true
+  [[ -z "$root_dir" ]] && { err_json "bad_argument" "Directory required" "false" "{}" "ark tasks ingest-dir <dir> --task-type <type> --batch-id <id>"; exit 2; }
+  [[ -d "$root_dir" ]] || { err_json "bad_argument" "Directory not found: ${root_dir}" "false" "{}" ""; exit 2; }
+
+  local map_mode="subdir-as-case" task_type="" status="hold" priority="" batch_id=""
+  local concurrency="12" file_concurrency="" resume="false"
+  local include_file exclude_file work_dir
+  work_dir=$(mktemp -d)
+  include_file="${work_dir}/include-globs"
+  exclude_file="${work_dir}/exclude-globs"
+  : > "$include_file"
+  : > "$exclude_file"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --map=*)              map_mode="${1#--map=}" ;;
+      --map)                shift; map_mode="$1" ;;
+      --task-type=*)        task_type="${1#--task-type=}" ;;
+      --task-type)          shift; task_type="$1" ;;
+      --status=*)           status="${1#--status=}" ;;
+      --status)             shift; status="$1" ;;
+      --priority=*)         priority="${1#--priority=}" ;;
+      --priority)           shift; priority="$1" ;;
+      --batch-id=*)         batch_id="${1#--batch-id=}" ;;
+      --batch-id)           shift; batch_id="$1" ;;
+      --concurrency=*)      concurrency="${1#--concurrency=}" ;;
+      --concurrency)        shift; concurrency="$1" ;;
+      --file-concurrency=*) file_concurrency="${1#--file-concurrency=}" ;;
+      --file-concurrency)   shift; file_concurrency="$1" ;;
+      --resume)             resume="true" ;;
+      --dry-run)            DRY_RUN=true ;;
+      --include=*)          printf '%s\n' "${1#--include=}" >> "$include_file" ;;
+      --include)            shift; printf '%s\n' "$1" >> "$include_file" ;;
+      --exclude=*)          printf '%s\n' "${1#--exclude=}" >> "$exclude_file" ;;
+      --exclude)            shift; printf '%s\n' "$1" >> "$exclude_file" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks ingest-dir <dir> --task-type <type> --batch-id <id>"; rm -rf "$work_dir"; exit 2 ;;
+    esac
+    shift || true
+  done
+
+  [[ "$map_mode" == "subdir-as-case" ]] || { err_json "bad_argument" "Only --map subdir-as-case is supported" "false" "{}" ""; rm -rf "$work_dir"; exit 2; }
+  [[ -n "$task_type" ]] || { err_json "bad_argument" "--task-type is required" "false" "{}" "ark tasks ingest-dir ${root_dir} --task-type audit_soat --batch-id <id>"; rm -rf "$work_dir"; exit 2; }
+  [[ -n "$batch_id" ]] || { err_json "bad_argument" "--batch-id is required" "false" "{}" "ark tasks ingest-dir ${root_dir} --task-type ${task_type} --batch-id <id>"; rm -rf "$work_dir"; exit 2; }
+  [[ "$concurrency" =~ ^[0-9]+$ && "$concurrency" -gt 0 ]] || { err_json "bad_argument" "--concurrency must be a positive integer" "false" "{}" ""; rm -rf "$work_dir"; exit 2; }
+  [[ -n "$file_concurrency" ]] || file_concurrency="$concurrency"
+  [[ "$file_concurrency" =~ ^[0-9]+$ && "$file_concurrency" -gt 0 ]] || { err_json "bad_argument" "--file-concurrency must be a positive integer" "false" "{}" ""; rm -rf "$work_dir"; exit 2; }
+
+  local root_abs; root_abs=$(abs_path "$root_dir")
+  local cases_jsonl="${work_dir}/cases.jsonl"
+  local files_tsv="${work_dir}/files.tsv"
+  local task_map_tsv="${work_dir}/task-map.tsv"
+  local uploaded_paths="${work_dir}/uploaded-paths"
+  local selected_files="${work_dir}/selected-files.tsv"
+  : > "$cases_jsonl"
+  : > "$files_tsv"
+  : > "$task_map_tsv"
+  : > "$uploaded_paths"
+
+  local case_count=0 file_count=0 total_bytes=0 skipped_bytes=0 skipped_files=0
+  local case_dir case_name case_dir_abs client_ref case_file_count case_bytes
+  while IFS= read -r case_dir; do
+    case_name=$(file_basename "$case_dir")
+    [[ "$case_name" == .* ]] && continue
+    case_dir_abs=$(abs_path "$case_dir")
+    client_ref="$case_name"
+    case_file_count=0
+    case_bytes=0
+
+    local case_files_tmp="${work_dir}/case-files"
+    : > "$case_files_tmp"
+    while IFS= read -r file_path; do
+      local rel base size
+      rel="${file_path#${case_dir}/}"
+      base=$(file_basename "$file_path")
+      is_ignored_bulk_file "$rel" "$base" && continue
+      if [[ -s "$include_file" ]] && ! matches_any_glob_file "$rel" "$base" "$include_file"; then
+        continue
+      fi
+      if matches_any_glob_file "$rel" "$base" "$exclude_file"; then
+        continue
+      fi
+
+      size=$(file_size_bytes "$file_path")
+      if [[ -n "$size" && "$size" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
+        err_json "payload_too_large" "File exceeds $(upload_limit_mb)MB upload limit: ${file_path}" "false" \
+          "$(jq -n --arg file "$file_path" --argjson sz "$size" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{file:$file,size_bytes:$sz,max_bytes:$max}')" \
+          "Use files no larger than $(upload_limit_mb)MB or raise ARK_MAX_UPLOAD_BYTES if the API supports it"
+        rm -rf "$work_dir"; exit 2
+      fi
+
+      local local_path="${case_name}/${rel}"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$local_path" "$file_path" "$size" "$client_ref" "$base" >> "$case_files_tmp"
+      case_file_count=$((case_file_count + 1))
+      case_bytes=$((case_bytes + size))
+    done < <(find "$case_dir" -type f -print | sort)
+
+    [[ "$case_file_count" -eq 0 ]] && continue
+    cat "$case_files_tmp" >> "$files_tsv"
+    jq -cn \
+      --arg client_ref "$client_ref" \
+      --arg title "$case_name" \
+      --arg root "$root_abs" \
+      --arg source "$case_dir_abs" \
+      --arg batch_id "$batch_id" \
+      --argjson file_count "$case_file_count" \
+      --argjson size_bytes "$case_bytes" \
+      '{client_ref:$client_ref,title:$title,root_dir:$root,source_path:$source,batch_id:$batch_id,file_count:$file_count,size_bytes:$size_bytes}' >> "$cases_jsonl"
+    case_count=$((case_count + 1))
+    file_count=$((file_count + case_file_count))
+    total_bytes=$((total_bytes + case_bytes))
+  done < <(find "$root_dir" -mindepth 1 -maxdepth 1 -type d -print | sort)
+
+  if [[ "$case_count" -eq 0 ]]; then
+    err_json "no_cases" "No case subdirectories with uploadable files found" "false" "{}" ""
+    rm -rf "$work_dir"; exit 2
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    local sample_cases
+    sample_cases=$(head -20 "$cases_jsonl" | jq -s '.')
+    jq -n \
+      --arg v "$ARK_VERSION" \
+      --arg root "$root_abs" \
+      --arg map "$map_mode" \
+      --arg task_type "$task_type" \
+      --arg status "$status" \
+      --arg priority "$priority" \
+      --arg batch_id "$batch_id" \
+      --argjson cases "$case_count" \
+      --argjson files "$file_count" \
+      --argjson bytes "$total_bytes" \
+      --argjson sample "$sample_cases" \
+      '{ok:true,cli_version:$v,dry_run:true,data:{root_dir:$root,map:$map,task_type:$task_type,status:$status,priority:$priority,batch_id:$batch_id,cases:$cases,files:$files,total_bytes:$bytes,sample_cases:$sample}}'
+    rm -rf "$work_dir"; return
+  fi
+
+  if [[ "$resume" == "true" ]]; then
+    local encoded_batch_id; encoded_batch_id=$(printf '%s' "$batch_id" | jq -sRr @uri)
+    http_request "GET" "/api/batches/${encoded_batch_id}/status"
+    if [[ "$HTTP_STATUS" == "200" ]]; then
+      printf '%s' "$HTTP_BODY" | jq -r '
+        [.. | objects
+          | select((.client_ref? // .clientRef? // empty) != "" and ((.task_id? // .taskId? // .id? // empty) != ""))
+          | [(.client_ref // .clientRef), (.task_id // .taskId // .id)]
+          | @tsv] | unique[]' >> "$task_map_tsv"
+      printf '%s' "$HTTP_BODY" | jq -r '
+        [.. | objects | (.local_path? // .localPath? // empty)] | unique[]' >> "$uploaded_paths"
+    elif [[ "$HTTP_STATUS" != "404" ]]; then
+      handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+    fi
+  fi
+
+  local chunk_file="${work_dir}/case-chunk.jsonl"
+  : > "$chunk_file"
+  local chunk_count=0
+  while IFS= read -r case_json; do
+    local cref
+    cref=$(printf '%s' "$case_json" | jq -r '.client_ref')
+    if awk -F '\t' -v ref="$cref" '$1 == ref {found=1; exit} END {exit found ? 0 : 1}' "$task_map_tsv"; then
+      continue
+    fi
+    printf '%s\n' "$case_json" >> "$chunk_file"
+    chunk_count=$((chunk_count + 1))
+    if [[ "$chunk_count" -ge 500 ]]; then
+      cmd_tasks_ingest_dir_create_task_chunk "$chunk_file" "$task_map_tsv" "$batch_id" "$task_type" "$status" "$priority"
+      : > "$chunk_file"; chunk_count=0
+    fi
+  done < "$cases_jsonl"
+  [[ "$chunk_count" -gt 0 ]] && cmd_tasks_ingest_dir_create_task_chunk "$chunk_file" "$task_map_tsv" "$batch_id" "$task_type" "$status" "$priority"
+
+  : > "$selected_files"
+  while IFS=$'\t' read -r local_path file_path size client_ref base; do
+    if [[ "$resume" == "true" ]] && grep -Fx "$local_path" "$uploaded_paths" >/dev/null 2>&1; then
+      skipped_files=$((skipped_files + 1))
+      skipped_bytes=$((skipped_bytes + size))
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$local_path" "$file_path" "$size" "$client_ref" "$base" >> "$selected_files"
+  done < "$files_tsv"
+
+  local upload_results="${work_dir}/upload-results.tsv"
+  : > "$upload_results"
+
+  local processed_cases=0 prepared_files=0
+  while IFS= read -r case_json; do
+    client_ref=$(printf '%s' "$case_json" | jq -r '.client_ref')
+    local task_id
+    task_id=$(awk -F '\t' -v ref="$client_ref" '$1 == ref {print $2; exit}' "$task_map_tsv")
+    if [[ -z "$task_id" ]]; then
+      err_json "batch_mapping_missing" "No task_id returned for client_ref ${client_ref}" "false" "{}" ""
+      rm -rf "$work_dir"; exit 1
+    fi
+
+    local task_files="${work_dir}/files-${processed_cases}.tsv"
+    awk -F '\t' -v ref="$client_ref" '$4 == ref {print}' "$selected_files" > "$task_files"
+    if [[ ! -s "$task_files" ]]; then
+      processed_cases=$((processed_cases + 1))
+      continue
+    fi
+
+    local input_chunk="${work_dir}/input-chunk.jsonl"
+    : > "$input_chunk"
+    local input_chunk_count=0
+    while IFS=$'\t' read -r local_path file_path size _client_ref base; do
+      jq -n \
+        --arg lp "$local_path" \
+        --arg filename "$base" \
+        --arg source "$file_path" \
+        --argjson sz "$size" \
+        '{client_ref:$lp,filename:$filename,size_bytes:$sz,mime_type:"application/octet-stream",description:$source,path_type:"storage"}' >> "$input_chunk"
+      input_chunk_count=$((input_chunk_count + 1))
+      if [[ "$input_chunk_count" -ge 1000 ]]; then
+        cmd_tasks_ingest_dir_prepare_and_upload "$task_id" "$input_chunk" "$task_files" "$upload_results" "$file_concurrency"
+        prepared_files=$((prepared_files + input_chunk_count))
+        printf '[ark] uploaded/prepared %s/%s files (%s skipped)\n' "$prepared_files" "$file_count" "$skipped_files" >&2
+        : > "$input_chunk"; input_chunk_count=0
+      fi
+    done < "$task_files"
+
+    if [[ "$input_chunk_count" -gt 0 ]]; then
+      cmd_tasks_ingest_dir_prepare_and_upload "$task_id" "$input_chunk" "$task_files" "$upload_results" "$file_concurrency"
+      prepared_files=$((prepared_files + input_chunk_count))
+      printf '[ark] uploaded/prepared %s/%s files (%s skipped)\n' "$prepared_files" "$file_count" "$skipped_files" >&2
+    fi
+
+    processed_cases=$((processed_cases + 1))
+  done < "$cases_jsonl"
+
+  local uploaded_files failed_files uploaded_bytes
+  uploaded_files=$(awk -F '\t' '$1 == "ok" {c++} END {print c+0}' "$upload_results")
+  failed_files=$(awk -F '\t' '$1 == "fail" {c++} END {print c+0}' "$upload_results")
+  uploaded_bytes=$(awk -F '\t' '$1 == "ok" {s += $3} END {print s+0}' "$upload_results")
+
+  if [[ "$failed_files" -gt 0 ]]; then
+    local failures
+    failures=$(awk -F '\t' '$1 == "fail" {print $2}' "$upload_results" | head -20 | jq -R '.' | jq -s '.')
+    err_json "upload_failed" "${failed_files} file uploads failed" "true" \
+      "$(jq -n --argjson failures "$failures" '{sample_failures:$failures}')" \
+      "Retry with --resume and the same --batch-id"
+    rm -rf "$work_dir"; exit 1
+  fi
+
+  local data
+  data=$(jq -n \
+    --arg root "$root_abs" \
+    --arg batch_id "$batch_id" \
+    --arg task_type "$task_type" \
+    --arg status "$status" \
+    --argjson cases "$case_count" \
+    --argjson files "$file_count" \
+    --argjson skipped_files "$skipped_files" \
+    --argjson skipped_bytes "$skipped_bytes" \
+    --argjson uploaded_files "$uploaded_files" \
+    --argjson uploaded_bytes "$uploaded_bytes" \
+    --argjson total_bytes "$total_bytes" \
+    '{root_dir:$root,batch_id:$batch_id,task_type:$task_type,status:$status,cases:$cases,files:$files,total_bytes:$total_bytes,uploaded_files:$uploaded_files,uploaded_bytes:$uploaded_bytes,skipped_files:$skipped_files,skipped_bytes:$skipped_bytes}')
+  rm -rf "$work_dir"
+  ok_response "$data" "{}" "$(jq -n --arg bid "$batch_id" '{release_batch:("ark tasks release-batch --batch-id " + $bid + " --limit <N>")}')"
+}
+
+cmd_tasks_ingest_dir_create_task_chunk() {
+  local chunk_file="$1" task_map_tsv="$2" batch_id="$3" task_type="$4" status="$5" priority="$6"
+  [[ -s "$chunk_file" ]] || return
+
+  local body
+  body=$(jq -s \
+    --arg batch_id "$batch_id" \
+    --arg task_type "$task_type" \
+    --arg status "$status" \
+    --arg priority "$priority" \
+    '{batch_id:$batch_id,tasks:map({
+      client_ref,
+      title,
+      description:("Bulk ingest case " + .title),
+      task_type:$task_type,
+      status:$status,
+      context:{batch_id:$batch_id,client_ref:.client_ref,source_path:.source_path,root_dir:.root_dir,file_count:.file_count,size_bytes:.size_bytes}
+    } + (if $priority != "" then {priority:$priority} else {} end))}' "$chunk_file")
+
+  local chunk_sig; chunk_sig=$(cksum "$chunk_file" | awk '{print $1}')
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}:tasks-batch:${chunk_sig}"
+  http_request "POST" "/api/tasks/batch" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  printf '%s' "$HTTP_BODY" | jq -r '
+    (if (.data | type) == "object" then
+      ((.data.created // []) + (.data.deduped // []) + (.data.tasks // []) + (.data.results // []))
+    elif (.data | type) == "array" then .data
+    else
+      ((.created // []) + (.deduped // []) + (.tasks // []) + (.results // []))
+    end)[]
+    | [(.client_ref // .clientRef // .ref // .external_id // ""), (.task_id // .taskId // .id // .task.id // "")]
+    | select(.[0] != "" and .[1] != "")
+    | @tsv' >> "$task_map_tsv"
+}
+
+cmd_tasks_ingest_dir_prepare_and_upload() {
+  local task_id="$1" input_chunk="$2" task_files="$3" upload_results="$4" file_concurrency="$5"
+  [[ -s "$input_chunk" ]] || return
+
+  local body ikey upload_plan
+  body=$(jq -s '{files:.}' "$input_chunk")
+  local chunk_sig; chunk_sig=$(cksum "$input_chunk" | awk '{print $1}')
+  ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}:inputs-batch:${task_id}:${chunk_sig}"
+  http_request "POST" "/api/tasks/${task_id}/inputs/batch" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  upload_plan=$(mktemp)
+  printf '%s' "$HTTP_BODY" | jq -r '
+    (.data.inputs // .data.files // .data.uploads // .inputs // .files // .uploads // [])[]
+    | [(.client_ref // .clientRef // .local_path // .localPath // .path // ""), (.upload_url // .uploadUrl // .signed_url // .signedUrl // .url // "")]
+    | select(.[0] != "" and .[1] != "")
+    | @tsv' > "$upload_plan"
+
+  if [[ ! -s "$upload_plan" ]]; then
+    rm -f "$upload_plan"
+    err_json "batch_inputs_invalid_response" "No signed upload URLs returned for task ${task_id}" "false" "{}" ""
+    exit 1
+  fi
+
+  local pids=()
+  local local_path signed_url file_path size
+  while IFS=$'\t' read -r local_path signed_url; do
+    file_path=$(awk -F '\t' -v lp="$local_path" '$1 == lp {print $2; exit}' "$task_files")
+    size=$(awk -F '\t' -v lp="$local_path" '$1 == lp {print $3; exit}' "$task_files")
+    if [[ -z "$file_path" || ! -f "$file_path" ]]; then
+      printf 'fail\t%s\t0\n' "$local_path" >> "$upload_results"
+      continue
+    fi
+
+    (
+      if curl_put_signed_file "$file_path" "$signed_url"; then
+        printf 'ok\t%s\t%s\n' "$local_path" "$size" >> "$upload_results"
+      else
+        printf 'fail\t%s\t%s\n' "$local_path" "$size" >> "$upload_results"
+      fi
+    ) &
+    pids+=("$!")
+
+    if [[ "${#pids[@]}" -ge "$file_concurrency" ]]; then
+      local pid
+      for pid in "${pids[@]}"; do wait "$pid" || true; done
+      pids=()
+    fi
+  done < "$upload_plan"
+
+  local pid
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  rm -f "$upload_plan"
+}
+
+# ─── tasks release-batch ───────────────────────────────────────────────────────
+cmd_tasks_release_batch() {
+  local batch_id="" limit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --batch-id=*) batch_id="${1#--batch-id=}" ;;
+      --batch-id)   shift; batch_id="$1" ;;
+      --limit=*)    limit="${1#--limit=}" ;;
+      --limit)      shift; limit="$1" ;;
+      --dry-run)    DRY_RUN=true ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks release-batch --batch-id <id> --limit <N>"; exit 2 ;;
+    esac
+    shift || true
+  done
+
+  [[ -n "$batch_id" ]] || { err_json "bad_argument" "--batch-id is required" "false" "{}" "ark tasks release-batch --batch-id <id> --limit <N>"; exit 2; }
+  if [[ -n "$limit" && (! "$limit" =~ ^[0-9]+$ || "$limit" -le 0) ]]; then
+    err_json "bad_argument" "--limit must be a positive integer" "false" "{}" ""; exit 2
+  fi
+
+  local encoded_batch_id; encoded_batch_id=$(printf '%s' "$batch_id" | jq -sRr @uri)
+  local endpoint="/api/batches/${encoded_batch_id}/release"
+  [[ -n "$limit" ]] && endpoint="${endpoint}?limit=${limit}"
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "$endpoint" "{}"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "$endpoint" "{}" "$ikey"
   [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
   local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
@@ -1077,7 +1537,7 @@ cmd_tasks_outputs_upload() {
 
   local size_bytes; size_bytes=$(file_size_bytes "$file_path")
   if [[ -n "$size_bytes" && "$size_bytes" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
-    err_json "payload_too_large" "File exceeds 50MB upload limit" "false" \
+    err_json "payload_too_large" "File exceeds $(upload_limit_mb)MB upload limit" "false" \
       "$(jq -n --argjson sz "$size_bytes" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{size_bytes:$sz,max_bytes:$max}')" \
       "Stage the file to Supabase Storage and use 'ark tasks outputs submit --storage-path storage://... --size <bytes>' instead"
     exit 2
@@ -1292,7 +1752,7 @@ cmd_knowledge_upload() {
 
   local size_bytes; size_bytes=$(file_size_bytes "$file_path")
   if [[ -n "$size_bytes" && "$size_bytes" -gt "$ARK_MAX_UPLOAD_BYTES" ]]; then
-    err_json "payload_too_large" "File exceeds 50MB upload limit" "false" \
+    err_json "payload_too_large" "File exceeds $(upload_limit_mb)MB upload limit" "false" \
       "$(jq -n --argjson sz "$size_bytes" --argjson max "$ARK_MAX_UPLOAD_BYTES" '{size_bytes:$sz,max_bytes:$max}')" ""
     exit 2
   fi
@@ -1628,6 +2088,13 @@ cmd_skills() {
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:input:upload:1\"",
           "ark tasks inputs upload \"$FOLLOWON_TASK_ID\" ./seed-data.csv --description \"Extracted from parent task\""
         ],
+        bulk_ingest_dir: [
+          "ark tasks ingest-dir \"./Solicitud Mundial Auditoria 2\" --map subdir-as-case --task-type audit_soat --status hold --batch-id carga-soat-2026-07 --concurrency 12 --resume --dry-run",
+          "ark tasks ingest-dir \"./Solicitud Mundial Auditoria 2\" --map subdir-as-case --task-type audit_soat --status hold --batch-id carga-soat-2026-07 --concurrency 12 --resume"
+        ],
+        release_batch: [
+          "ark tasks release-batch --batch-id carga-soat-2026-07 --limit 100"
+        ],
         fetch_document_url: [
           "# Get a short-lived signed URL (~1h) to download a stored input or output",
           "ark tasks documents url \"$TASK_ID\" output \"$OUTPUT_ID\" | jq -r '.data.url'"
@@ -1721,8 +2188,8 @@ cmd_skills() {
         path_type:    ["filesystem","storage","url"]
       },
       upload_limits: {
-        max_file_bytes: 52428800,
-        note: "50 MB per file. Larger artifacts must be staged to Supabase Storage and registered via `outputs submit --storage-path`."
+        max_file_bytes: 524288000,
+        note: "500 MB per file by default, matching the task-documents bucket limit. Override ARK_MAX_UPLOAD_BYTES only if the API/bucket limit changes."
       },
       confidence_routing: {
         ">=0.85": "transitions to done — no human review needed",
@@ -1751,6 +2218,7 @@ cmd_skills() {
         "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
         "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
         "audit_soat":          "Audita factura SOAT. Usar workflow execute_queued_task.",
+        "soat_glosa_mail":     "Comunicación de glosas SOAT. Usar workflow execute_queued_task o flujo específico del lote si aplica.",
         "hospital_devolucion_batch":      "Lote de glosas (Excel/CSV). Procesado por hospital-devolucion-batch-parse, que crea una task hospital_devolucion por glosa.",
         "batch-denial-mail":              "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail.",
         "hospital_preventiva_batch_mail": "DELEGAR a ark audit send-preventiva-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_preventiva_mail."
@@ -1887,7 +2355,7 @@ TASKS
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
-    [--context=<json>]  [--status=hold|draft|queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|batch-denial-mail|hospital_preventiva_batch_mail]
+    [--context=<json>]  [--status=hold|draft|queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|soat_glosa_mail|batch-denial-mail|hospital_preventiva_batch_mail]
   ark tasks update <id>              Set workspace log path (agent only)
     --log-path=<storage-path>
   ark tasks context <id>             Set or clear the task context (human only)
@@ -1904,12 +2372,21 @@ TASKS
     --reason=<reason>
   ark tasks delete <id>              Delete a draft task (human only)
   ark tasks events <id>              Full audit timeline (read-only)
+  ark tasks ingest-dir <dir>         Bulk-create tasks and upload inputs from subdirs
+    --map=subdir-as-case  --task-type=<type>  --batch-id=<id>
+    [--status=hold|draft|queued]  [--priority=]  [--concurrency=12]
+    [--file-concurrency=12]  [--resume]  [--dry-run]
+    [--include=<glob>]  [--exclude=<glob>]
+    Note: status=hold requires a human API key and task_type=audit_soat.
+  ark tasks release-batch            Release held tasks in a batch to draft
+    --batch-id=<id>  [--limit=<N>]
+    Note: release-batch requires a human API key.
 
 INPUTS
   ark tasks inputs list <id>         List registered input paths
   ark tasks inputs add <id>          Register an input path (reference only)
     --path=<path>  [--type=filesystem|storage|url]  [--description=]
-  ark tasks inputs upload <id> <file-path>    Upload a file as an input (≤ 50 MB)
+  ark tasks inputs upload <id> <file-path>    Upload a file as an input (≤ 500 MB)
     [--description=]  [--local-path=]  [--path-type=filesystem|storage|url]
   ark tasks inputs remove <id> <input-id>   Remove a human-registered input
 
@@ -1926,7 +2403,7 @@ OUTPUTS
   ark tasks outputs submit <id>      Submit an inline or pre-staged deliverable (agent only)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
     [--data=<json>]  [--storage-path=]  [--size=<bytes>]
-  ark tasks outputs upload <id> <file-path>   Upload a file deliverable (agent only, ≤ 50 MB)
+  ark tasks outputs upload <id> <file-path>   Upload a file deliverable (agent only, ≤ 500 MB)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
     [--local-path=]
   ark tasks outputs get <id> <output-id>   Fetch a single output
@@ -2039,6 +2516,8 @@ main() {
         block)    cmd_tasks_block "$@" ;;
         events)   cmd_tasks_events "$@" ;;
         delete)   cmd_tasks_delete "$@" ;;
+        ingest-dir)    cmd_tasks_ingest_dir "$@" ;;
+        release-batch) cmd_tasks_release_batch "$@" ;;
         inputs)
           local sub2="${1:-}"; shift || true
           case "$sub2" in
