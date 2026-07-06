@@ -665,7 +665,7 @@ deliverable whether it is JSON, CSV, HTML, markdown, a PDF, or any other type.
 | `progress` | Intermediate work product (reasoning / plan / findings) the reviewer reads. Any format. Supporting evidence (screenshots, logs, intermediate data) also allowed when it belongs to the milestone narrative | `outputs upload <file> --type <t> --label progress` |
 | `error_log` | Raw trace on failure only — highlighted as a failure signal. Do not use for routine milestone narrative (causes alarm fatigue) | `outputs upload <file.log> --type log --label error_log` |
 | Any label, pre-staged in Storage | Registered by reference | `outputs submit --type <t> --label <l> --storage-path 'storage://...' --size <bytes>` |
-| Any label, larger than 50 MB | Stage out-of-band first | Stage to Storage → `outputs submit --storage-path` |
+| Any label, larger than 500 MB | Stage out-of-band first | Stage to Storage → `outputs submit --storage-path` |
 
 ### Status transitions available to you
 
@@ -752,10 +752,11 @@ have locally — it pushes the file and records the row in one call. Never
 inline binary content through `--data`, and never call `submit` with a local
 filesystem path that has not been staged to Storage.
 
-**Upload endpoints cap at 50 MB per file.** `ark tasks inputs upload` and
+**Upload endpoints cap at 500 MB per file by default.** `ark tasks inputs upload` and
 `ark tasks outputs upload` short-circuit before the HTTP call when the file is
 larger. For anything bigger, stage the file to Supabase Storage directly and
 register it with `outputs submit --storage-path` or `inputs add --path`.
+Override `ARK_MAX_UPLOAD_BYTES` only if the backend limit changes.
 
 **`--label progress` is for intermediate work products (and their supporting
 evidence); `--label error_log` is for failures only.** Progress is the agent's
@@ -907,7 +908,11 @@ ark tasks claim <id>                          Claim it (queued → in_progress)
 ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read
 ark tasks inputs add <id> --path <p> --type   Register a reference-only source
-ark tasks inputs upload <id> <file>           Upload a file as an input (≤ 50 MB)
+ark tasks inputs upload <id> <file>           Upload a file as an input (≤ 500 MB)
+ark tasks ingest-dir <dir> --map subdir-as-case --task-type <type> --batch-id <id>
+                                              Bulk-create case tasks and upload inputs
+ark tasks release-batch --batch-id <id> --limit <N>
+                                              Release held batch tasks to draft
 ark tasks comments post <id> --type note      Post progress updates
 ark tasks outputs upload <id> <file> --type <t> --label report
                                               Upload the final deliverable (format per task context)
