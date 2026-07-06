@@ -24,6 +24,30 @@ Run `ark skills` at cold-start to get the full capability map: workflows, exit c
 
 ---
 
+## Task Lifecycle
+
+The task lifecycle begins before agent work:
+
+```text
+hold -> draft -> queued -> in_progress -> (blocked|review) -> done
+```
+
+- `hold`: frozen parking state. Neither OCR nor IA should touch the task.
+- `draft`: OCR/pre-processing may run, but IA is still frozen.
+- `queued`: IA/agent work is eligible to claim.
+
+To release a held task into OCR/pre-processing:
+
+```bash
+ark tasks status "$TASK_ID" --status draft
+```
+
+Only a human user's API key should create tasks in non-`queued` states such as
+`hold` or `draft`; agent-created follow-on tasks should go directly to
+`queued`.
+
+---
+
 ## Output Envelope
 
 Every successful command outputs this shape to stdout:
@@ -136,6 +160,7 @@ Use these to read and mutate task state:
 | `ark tasks list` | Fetch queued tasks |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |
+| `ark tasks status <id> --status draft` | Release a held task into draft/OCR |
 | `ark tasks update <id> --log-path` | Set workspace storage path |
 | `ark tasks context-set <id> --set key=value` | **Merge fields into context** (preserves existing fields) |
 | `ark tasks outputs upload <id>` | Push output file and record it |

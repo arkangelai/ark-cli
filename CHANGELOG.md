@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## Unreleased
+
+### Added
+- Documented the `hold -> draft -> queued` task lifecycle and the `ark tasks status <id> --status draft` release command.
+- Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
+
+---
+
 ## [0.5.0] — 2026-06-18
 
 ### Added
