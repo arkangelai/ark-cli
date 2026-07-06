@@ -1062,7 +1062,7 @@ cmd_tasks_ingest_dir() {
 
     [[ "$case_file_count" -eq 0 ]] && continue
     cat "$case_files_tmp" >> "$files_tsv"
-    jq -n \
+    jq -cn \
       --arg client_ref "$client_ref" \
       --arg title "$case_name" \
       --arg root "$root_abs" \
@@ -1122,7 +1122,7 @@ cmd_tasks_ingest_dir() {
   while IFS= read -r case_json; do
     local cref
     cref=$(printf '%s' "$case_json" | jq -r '.client_ref')
-    if grep -F "$(printf '%s\t' "$cref")" "$task_map_tsv" >/dev/null 2>&1; then
+    if awk -F '\t' -v ref="$cref" '$1 == ref {found=1; exit} END {exit found ? 0 : 1}' "$task_map_tsv"; then
       continue
     fi
     printf '%s\n' "$case_json" >> "$chunk_file"
