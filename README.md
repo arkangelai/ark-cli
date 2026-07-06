@@ -44,15 +44,21 @@ ark auth status   # validates key against the API
 ## How It Works
 
 Tasks Ark implements a task queue for AI agents. A human creates a task with
-instructions and input data. The agent picks it up, executes it, and reports
-back. The API enforces every step — the agent cannot skip or reorder the lifecycle.
+instructions and input data. The task can start frozen in `hold`, move to
+`draft` for OCR/pre-processing, and only becomes agent-eligible once it reaches
+`queued`. The API enforces every step — the agent cannot skip or reorder the
+lifecycle.
 
 ### Task lifecycle
 
 ```
 [human creates]
       │
-   queued  ◄─────────────────────────────────┐
+   hold    (frozen: no OCR, no AI)
+      │
+   draft   (OCR can run; AI is frozen)
+      │
+   queued  (AI eligible) ◄───────────────────┐
       │                                       │
    in_progress  (agent claimed it)            │
       │                                       │
@@ -61,6 +67,12 @@ back. The API enforces every step — the agent cannot skip or reorder the lifec
       ├── review   (confidence < 0.85) ───────┤  human approves or requests changes
       │
       └── done     (confidence ≥ 0.85, or human approved)
+```
+
+To release a held task into OCR/pre-processing, run:
+
+```bash
+ark tasks status "$TASK_ID" --status draft
 ```
 
 ### What the agent does at each step
@@ -197,7 +209,7 @@ ark tasks context-set "$TASK_ID" \
 ```
 ark tasks list             [--status=] [--priority=] [--limit=20] [--cursor=] [--all]
 ark tasks get <id>
-ark tasks create           --title= [--description=] [--priority=] [--deadline=] [--context=] [--status=]
+ark tasks create           --title= [--description=] [--priority=] [--deadline=] [--context=] [--status=hold|draft|queued]
 ark tasks update <id>      --log-path=
 ark tasks context <id>     --data='<json>' | --clear          # human only
 ark tasks context-set <id> --set key=value [--set key2=val2]  # agent only, shallow merge

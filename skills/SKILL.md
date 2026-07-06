@@ -2,10 +2,10 @@
 name: tasks-ark-execution
 description: >
   Execute tasks from a task queue using the Tasks Ark CLI (ark). Covers the full
-  lifecycle: claiming a queued task, reading inputs, doing work, submitting outputs,
-  and completing with a confidence score. Also handles blockers, follow-on task
-  creation, and re-execution after human feedback. Use when you are an agent that
-  needs to pick up and execute tasks from the queue.
+  agent lifecycle: claiming a queued task, reading inputs, doing work, submitting
+  outputs, and completing with a confidence score. Also handles blockers,
+  follow-on task creation, and re-execution after human feedback. Use when you
+  are an agent that needs to pick up and execute tasks from the queue.
 version: "1.4"
 compatibility: Requires ark CLI installed and configured with a valid api-key and url.
 ---
@@ -16,10 +16,12 @@ You are an agent executing tasks via the Tasks Ark CLI (`ark`). Your job is to
 pick up queued tasks, execute them, and report back — with enough transparency
 that a human reviewer can understand exactly what you did and why.
 
-Each task has a clear lifecycle: claim it, do the work, submit outputs, and close
-it with an honest confidence score. The API enforces every transition; you cannot
-skip steps or take shortcuts. Follow `next_commands` from each response — it tells
-you exactly what is valid next.
+Each task has a clear lifecycle. Before agent work, a human may park it in
+`hold` (no OCR, no AI), release it to `draft` (OCR may run, AI frozen), and move
+it to `queued` when it is ready for an agent. Agents then claim it, do the work,
+submit outputs, and close it with an honest confidence score. The API enforces
+every transition; you cannot skip steps or take shortcuts. Follow `next_commands`
+from each response — it tells you exactly what is valid next.
 
 ---
 
@@ -667,6 +669,10 @@ deliverable whether it is JSON, CSV, HTML, markdown, a PDF, or any other type.
 
 ### Status transitions available to you
 
+Pre-agent states follow `hold -> draft -> queued`. A human can release a held
+task with `ark tasks status <id> --status draft`; agents should only claim
+`queued` work.
+
 | From | To | Command |
 |---|---|---|
 | `queued` | `in_progress` | `ark tasks claim <id>` |
@@ -674,8 +680,8 @@ deliverable whether it is JSON, CSV, HTML, markdown, a PDF, or any other type.
 | `in_progress` | `review` | `ark tasks complete <id> --confidence <0.85` |
 | `in_progress` | `blocked` | `ark tasks block <id> --reason "..."` |
 
-Any other transition returns `422`. Read `.error.detail.allowed` to see what is
-valid from the current state.
+Any other agent transition returns `422`. Read `.error.detail.allowed` to see
+what is valid from the current state.
 
 ### Writing execution metadata to context
 

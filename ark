@@ -1669,7 +1669,7 @@ cmd_skills() {
         ],
         agents_heartbeat: [
           "ark agents heartbeat --agent-id \"$AGENT_ID\"",
-          "ark agents heartbeat --agent-id \"$AGENT_ID\" --metadata '{\"cpu\":45,\"memory_mb\":512}'"
+          "ark agents heartbeat --agent-id \"$AGENT_ID\" --metadata \u0027{\"cpu\":45,\"memory_mb\":512}\u0027"
         ],
         batch_preventiva_mail: [
           "# Paso 1 — detectar que la tarea es de tipo hospital_preventiva_batch_mail",
@@ -1715,6 +1715,7 @@ cmd_skills() {
         on_retry: "Set ARK_IDEMPOTENCY_KEY=<same-key> before rerunning the command"
       },
       enums: {
+        task_status:  ["hold","draft","queued","in_progress","blocked","review","done","archived","cancelled"],
         output_type:  ["json","text","file","screenshot","log"],
         output_label: ["report","artifact","error_log","progress","diff"],
         path_type:    ["filesystem","storage","url"]
@@ -1726,6 +1727,13 @@ cmd_skills() {
       confidence_routing: {
         ">=0.85": "transitions to done — no human review needed",
         "<0.85":  "transitions to review — awaits human approval"
+      },
+      task_lifecycle: {
+        order: ["hold","draft","queued","in_progress","blocked","review","done"],
+        hold: "frozen parking state — neither OCR nor AI should touch it",
+        draft: "OCR/pre-processing may run; AI remains frozen",
+        queued: "AI/agent work is eligible to claim",
+        release_hold: "ark tasks status <id> --status draft"
       },
       output_envelope: {
         ok:               "boolean",
@@ -1874,12 +1882,12 @@ SETUP
 
 TASKS
   ark tasks list                     List tasks
-    [--status=queued|in_progress|blocked|review|done|archived|cancelled]
+    [--status=hold|draft|queued|in_progress|blocked|review|done|archived|cancelled]
     [--priority=low|medium|high|critical]  [--limit=20]  [--cursor=<iso-ts>]  [--all]
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
-    [--context=<json>]  [--status=queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|batch-denial-mail|hospital_preventiva_batch_mail]
+    [--context=<json>]  [--status=hold|draft|queued]  [--type=general|eps_audit|hospital_preventiva|hospital_devolucion|hospital_devolucion_batch|audit_soat|batch-denial-mail|hospital_preventiva_batch_mail]
   ark tasks update <id>              Set workspace log path (agent only)
     --log-path=<storage-path>
   ark tasks context <id>             Set or clear the task context (human only)
@@ -1888,6 +1896,7 @@ TASKS
     --set key=value  [--set key2=value2 ...]
   ark tasks status <id>              Transition status manually
     --status=<status>  [--confidence=]  [--comment-id=]
+    release hold with --status=draft
   ark tasks claim <id>               Transition queued → in_progress
   ark tasks complete <id>            Transition to done (>=0.85) or review (<0.85)
     --confidence=<0.0-1.0>
