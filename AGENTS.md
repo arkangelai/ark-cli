@@ -185,7 +185,7 @@ Use these to read and mutate task state:
 
 | Command | Purpose |
 |---|---|
-| `ark tasks list` | List tasks with business-ID filters, time windows, ordering, and field projection |
+| `ark tasks list` | List tasks with workflow, creator, business-ID, batch, parent, time-window, ordering, and field-projection filters |
 | `ark tasks stats` | Count all tasks by status in one request |
 | `ark tasks find <text>` | Search task title and business context; returns ID, status, and title |
 | `ark tasks get <id>` | Read a single task with next_commands |

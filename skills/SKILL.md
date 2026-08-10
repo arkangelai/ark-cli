@@ -139,8 +139,9 @@ document, or client case instead of UUID, resolve it first with:
 ark tasks find "<business identifier>"
 ```
 
-For exact first-class identifiers, use `ark tasks list --factura-key`,
-`--client-ref`, `--batch-id`, or `--parent-task-id`.
+For exact first-class fields, use `ark tasks list --task-type`,
+`--created-by-type`, `--factura-key`, `--client-ref`, `--batch-id`, or
+`--parent` (`--parent-task-id` is also accepted).
 
 ### Step 1: Generate a run ID
 
@@ -935,6 +936,9 @@ ark tasks list --status blocked --since <iso> --sort created_at --order asc --br
                                               Scan oldest blockers with a small payload
 ark tasks find "<business identifier>"        Find an existing task
 ark tasks list --factura-key "FE 57100"       Filter by exact business column
+ark tasks list --task-type audit_soat          Filter by task workflow kind
+ark tasks list --created-by-type agent         Filter by creator kind
+ark tasks list --parent "$PARENT_TASK_ID"      Filter child tasks by parent
 ark tasks claim-next                          Atomically claim available work
 ark tasks claim <id>                          Re-claim a known re-queued task
 ark tasks ask-review <id> [--reason=]         Request review without completing

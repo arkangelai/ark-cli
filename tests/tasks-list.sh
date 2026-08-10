@@ -99,6 +99,21 @@ assert_eq "2" "$missing_value_status" "missing option value exits with bad-argum
 assert_json_eq '"--since requires a value"' '.error.message' "$missing_value" "missing option value is explained"
 
 set +e
+missing_task_type=$( (cmd_tasks_list --task-type) 2>&1 )
+missing_task_type_status=$?
+empty_creator_type=$( (cmd_tasks_list --created-by-type=) 2>&1 )
+empty_creator_type_status=$?
+missing_parent=$( (cmd_tasks_list --parent) 2>&1 )
+missing_parent_status=$?
+set -e
+assert_eq "2" "$missing_task_type_status" "missing task type exits with bad-argument status"
+assert_json_eq '"--task-type requires a value"' '.error.message' "$missing_task_type" "missing task type is explained"
+assert_eq "2" "$empty_creator_type_status" "empty creator type exits with bad-argument status"
+assert_json_eq '"--created-by-type requires a value"' '.error.message' "$empty_creator_type" "empty creator type is explained"
+assert_eq "2" "$missing_parent_status" "missing parent exits with bad-argument status"
+assert_json_eq '"--parent requires a value"' '.error.message' "$missing_parent" "missing parent is explained"
+
+set +e
 empty_fields=$( (cmd_tasks_list --fields=) 2>&1 )
 empty_fields_status=$?
 set -e

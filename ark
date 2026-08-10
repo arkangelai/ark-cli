@@ -508,7 +508,8 @@ validate_task_fields() {
 cmd_tasks_list() {
   local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor="" fetch_all="false"
   local created_after="" created_before="" sort_f="" order_f="" fields_f=""
-  local factura_key="" client_ref="" batch_id="" parent_task_id=""
+  local task_type="" created_by_type="" factura_key="" client_ref=""
+  local batch_id="" parent_task_id="" option_name=""
   local brief="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -516,14 +517,18 @@ cmd_tasks_list() {
       --status)     [[ $# -ge 2 ]] || { err_json "bad_argument" "--status requires a value" "false" "{}" ""; exit 2; }; shift; status_f="$1" ;;
       --priority=*) priority_f="${1#--priority=}" ;;
       --priority)   [[ $# -ge 2 ]] || { err_json "bad_argument" "--priority requires a value" "false" "{}" ""; exit 2; }; shift; priority_f="$1" ;;
+      --type=*|--task-type=*) task_type="${1#*=}"; require_option_value "${1%%=*}" "$task_type" ;;
+      --type|--task-type) option_name="$1"; [[ $# -ge 2 ]] || require_option_value "$option_name" ""; shift; task_type="$1"; require_option_value "$option_name" "$task_type" ;;
+      --created-by-type=*) created_by_type="${1#--created-by-type=}"; require_option_value "--created-by-type" "$created_by_type" ;;
+      --created-by-type) [[ $# -ge 2 ]] || require_option_value "--created-by-type" ""; shift; created_by_type="$1"; require_option_value "--created-by-type" "$created_by_type" ;;
       --factura-key=*) factura_key="${1#--factura-key=}"; require_option_value "--factura-key" "$factura_key" ;;
       --factura-key) [[ $# -ge 2 ]] || require_option_value "--factura-key" ""; shift; factura_key="$1"; require_option_value "--factura-key" "$factura_key" ;;
       --client-ref=*) client_ref="${1#--client-ref=}"; require_option_value "--client-ref" "$client_ref" ;;
       --client-ref) [[ $# -ge 2 ]] || require_option_value "--client-ref" ""; shift; client_ref="$1"; require_option_value "--client-ref" "$client_ref" ;;
       --batch-id=*) batch_id="${1#--batch-id=}"; require_option_value "--batch-id" "$batch_id" ;;
       --batch-id) [[ $# -ge 2 ]] || require_option_value "--batch-id" ""; shift; batch_id="$1"; require_option_value "--batch-id" "$batch_id" ;;
-      --parent-task-id=*) parent_task_id="${1#--parent-task-id=}"; require_option_value "--parent-task-id" "$parent_task_id" ;;
-      --parent-task-id) [[ $# -ge 2 ]] || require_option_value "--parent-task-id" ""; shift; parent_task_id="$1"; require_option_value "--parent-task-id" "$parent_task_id" ;;
+      --parent=*|--parent-task-id=*) parent_task_id="${1#*=}"; require_option_value "${1%%=*}" "$parent_task_id" ;;
+      --parent|--parent-task-id) option_name="$1"; [[ $# -ge 2 ]] || require_option_value "$option_name" ""; shift; parent_task_id="$1"; require_option_value "$option_name" "$parent_task_id" ;;
       --limit=*)    limit="${1#--limit=}" ;;
       --limit)      [[ $# -ge 2 ]] || { err_json "bad_argument" "--limit requires a value" "false" "{}" ""; exit 2; }; shift; limit="$1" ;;
       --cursor=*)   cursor="${1#--cursor=}" ;;
@@ -564,6 +569,8 @@ cmd_tasks_list() {
     q=$(append_query_param "$q" "limit" "$limit")
     [[ -n "$status_f" ]]       && q=$(append_query_param "$q" "status" "$status_f")
     [[ -n "$priority_f" ]]     && q=$(append_query_param "$q" "priority" "$priority_f")
+    [[ -n "$task_type" ]]      && q=$(append_query_param "$q" "task_type" "$task_type")
+    [[ -n "$created_by_type" ]] && q=$(append_query_param "$q" "created_by_type" "$created_by_type")
     [[ -n "$factura_key" ]]    && q=$(append_query_param "$q" "factura_key" "$factura_key")
     [[ -n "$client_ref" ]]     && q=$(append_query_param "$q" "client_ref" "$client_ref")
     [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
@@ -2462,8 +2469,12 @@ cmd_skills() {
         ],
         find_task: [
           "ark tasks find \"<factura|siniestro|paciente_documento|caso_id>\"",
+          "ark tasks list --task-type \"<task-type>\"",
+          "ark tasks list --created-by-type \"<creator-type>\"",
           "ark tasks list --factura-key \"FE 57100\"",
           "ark tasks list --client-ref \"<client-ref>\"",
+          "ark tasks list --batch-id \"<batch-id>\"",
+          "ark tasks list --parent \"<parent-task-id>\"",
           "ark tasks get \"<id>\""
         ],
         execute_queued_task: [
@@ -2817,7 +2828,8 @@ TASKS
   ark tasks list                     List tasks
     [--status=hold|draft|queued|in_progress|blocked|review|done|archived|cancelled]
     [--priority=low|medium|high|critical]
-    [--factura-key=]  [--client-ref=]  [--batch-id=]  [--parent-task-id=]
+    [--type=|--task-type=]  [--created-by-type=]
+    [--factura-key=]  [--client-ref=]  [--batch-id=]  [--parent=|--parent-task-id=]
     [--limit=20]  [--cursor=<opaque>]  [--all]
     [--since=<iso-date>]  [--until=<iso-date>]  [--sort=<field>]  [--order=asc|desc]
     [--fields=id,status,title,created_at | --brief]

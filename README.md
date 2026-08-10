@@ -217,8 +217,10 @@ Use exact filters when the identifier is stored in a first-class task column:
 ```bash
 ark tasks list --factura-key "FE 57100"
 ark tasks list --client-ref "customer-case-42"
+ark tasks list --task-type "audit_soat"
+ark tasks list --created-by-type "agent"
 ark tasks list --batch-id "audit-2026-08"
-ark tasks list --parent-task-id "$PARENT_TASK_ID"
+ark tasks list --parent "$PARENT_TASK_ID"
 ```
 
 Use `find` when the value may be in the title or business context, including
@@ -281,7 +283,9 @@ ark tasks context-set "$TASK_ID" \
 
 ```
 ark tasks list             [--status=] [--priority=] [--factura-key=] [--client-ref=]
-                           [--batch-id=] [--parent-task-id=] [--limit=20] [--cursor=] [--all]
+                           [--type=|--task-type=] [--created-by-type=]
+                           [--batch-id=] [--parent=|--parent-task-id=]
+                           [--limit=20] [--cursor=] [--all]
                            [--since=<iso-date>] [--until=<iso-date>]
                            [--sort=<field>] [--order=asc|desc]
                            [--fields=<comma-separated-fields> | --brief]
