@@ -81,10 +81,12 @@ ark tasks status "$TASK_ID" --status draft
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)
 
-TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].id')
-
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+
+# Empty means no profile-eligible queued task is currently available.
+[[ -n "$TASK_ID" ]] || exit 0
 ```
 
 **2. Set up workspace and read inputs**
@@ -167,6 +169,12 @@ ark tasks release-batch --batch-id carga-soat-2026-07 --limit 100
 ```
 
 `release-batch` is also human-only; agent keys receive `403 forbidden` by design.
+
+Track ingest progress without scanning tasks:
+
+```bash
+ark batches status carga-soat-2026-07 --missing-limit 100
+```
 
 **5. Complete with a confidence score**
 ```bash
@@ -255,6 +263,8 @@ ark tasks context <id>     --data='<json>' | --clear          # human only
 ark tasks context-set <id> --set key=value [--set key2=val2]  # agent only, shallow merge
 ark tasks status <id>      --status= [--confidence=] [--comment-id=]
 ark tasks claim <id>
+ark tasks claim-next        [--task-type=]
+ark tasks ask-review <id>   [--reason=]
 ark tasks complete <id>    --confidence=
 ark tasks block <id>       --reason=
 ark tasks delete <id>
@@ -267,6 +277,16 @@ ark tasks events <id>
 ark tasks inputs list <id>
 ark tasks inputs add <id>  --path= [--type=filesystem|storage|url] [--description=]
 ark tasks inputs remove <id> <input-id>
+ark tasks inputs ocr <id> <input-id>
+ark batches status <batch-id> [--missing-limit=]
+ark reps prestadores       [--codigo-habilitacion=] [--nit=] [--razon-social=] [--nombre=]
+                           [--departamento=] [--municipio=] [--habilitado=SI|NO]
+                           [--nivel=] [--naturaleza-juridica=] [--limit=] [--offset=]
+ark reps servicios         [--codigo-habilitacion=] [--numero-sede=] [--serv-codigo=]
+                           [--serv-nombre=] [--grupo-servicio=] [--departamento=]
+                           [--municipio=] [--habilitado=SI|NO] [--complejidad=]
+                           [--modalidad=] [--limit=] [--offset=]
+ark reps habilitacion <codigo>
 ark tasks comments list <id>
 ark tasks comments post <id>     --label=note|blocker|comment|approved|changes_requested --body=
 ark tasks comments edit <id> <comment-id>   --body=

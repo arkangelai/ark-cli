@@ -78,22 +78,16 @@ the message to the user. Exit code `6` means the install prefix is not writable.
 
 Este workflow se aplica cuando `.data[0].task_type` es `batch-denial-mail`. El agente no razona sobre el contenido — solo ejecuta el script y reporta el resultado.
 
-### Paso 1: Detectar la tarea
-
-```bash
-ark tasks list --status queued --limit 1
-```
-
-Leer `.data[0].task_type`. Si es `batch-denial-mail`, seguir este workflow. Si no, usar Workflow 1.
-
-### Paso 2: Tomar la tarea
+### Paso 1: Tomar y detectar la tarea
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+CLAIM=$(ark tasks claim-next --task-type batch-denial-mail)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 ```
 
-Verificar que `.data.status` sea `"in_progress"` antes de continuar.
+Leer `.data.task_type`. Si es `batch-denial-mail`, seguir este workflow. Si no,
+usar Workflow 1. Verificar que `.data.status` sea `"in_progress"` antes de continuar.
 
 ### Paso 3: Ejecutar el script
 
@@ -150,20 +144,25 @@ TASK_RUN_ID=$(ark gen-uuid)
 Never reuse a `TASK_RUN_ID` across different execution runs. If a task is
 re-queued after review or a blocker, generate a fresh one.
 
-### Step 2: Find a queued task
+### Step 2: Atomically claim the next queued task
 
 ```bash
-ark tasks list --status queued --limit 1
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 ```
 
-Read from the response:
-- `.data[0].id` → store as `TASK_ID`. Required for all subsequent commands.
-- `.data[0].title` → what the task is.
-- `.data[0].description` → full human explanation of the goal.
-- `.data[0].context` → structured JSON instructions. This is your primary input.
-- `.meta.count` → if `0`, no work is available. Exit gracefully.
+This is one atomic operation. Never use `tasks list --limit 1` followed by
+`tasks claim`; two workers can select the same task before either claim lands.
 
-If `.meta.count` is `0`:
+Read from the response:
+- `.data.id` → store as `TASK_ID`. Required for all subsequent commands.
+- `.data.title` → what the task is.
+- `.data.description` → full human explanation of the goal.
+- `.data.context` → structured JSON instructions. This is your primary input.
+- missing or empty `.data.id` → no eligible work is available. Exit gracefully.
+
+If `TASK_ID` is empty:
 
 ```json
 {"ok": false, "error": "No queued tasks available"}
@@ -171,14 +170,9 @@ If `.meta.count` is `0`:
 
 Exit with code `0`. Do not retry in a tight loop.
 
-### Step 3: Claim the task
+### Step 3: Validate the claim
 
-```bash
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
-```
-
-Read from the response:
+The claim response contains:
 - `.data.status` → must be `"in_progress"`. If not, something is wrong — stop and report.
 - `.idempotent_replay` → if `true`, this claim was already made in a prior attempt. Continue normally.
 - `.next_commands` → the map of valid next operations. Read it. Follow it.
@@ -865,15 +859,12 @@ A successful task execution produces all of the following:
 # Setup
 TASK_RUN_ID=$(ark gen-uuid)
 
-# Find work
-TASK_JSON=$(ark tasks list --status queued --limit 1)
-TASK_ID=$(echo "$TASK_JSON" | jq -r '.data[0].id')
-CONTEXT=$(echo "$TASK_JSON" | jq -c '.data[0].context')
-# e.g. CONTEXT = {"analyze": "sales data", "output_format": "summary_json"}
-
-# Claim
+# Atomically find and claim work
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+TASK_JSON=$(ark tasks claim-next)
+TASK_ID=$(echo "$TASK_JSON" | jq -r '.data.id // empty')
+CONTEXT=$(echo "$TASK_JSON" | jq -c '.data.context')
+# e.g. CONTEXT = {"analyze": "sales data", "output_format": "summary_json"}
 
 # Set workspace
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
@@ -923,8 +914,9 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 ## Quick Reference
 
 ```
-ark tasks list --status queued --limit 1      Find available work
-ark tasks claim <id>                          Claim it (queued → in_progress)
+ark tasks claim-next                          Atomically claim available work
+ark tasks claim <id>                          Re-claim a known re-queued task
+ark tasks ask-review <id> [--reason=]         Request review without completing
 ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read
 ark tasks inputs add <id> --path <p> --type   Register a reference-only source
