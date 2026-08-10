@@ -8,6 +8,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks stats` — fetches the complete task-status histogram from
+  `GET /api/tasks/stats` in one request, avoiding exhaustive pagination for
+  operational counts.
 - `ark tasks list` now supports creation-time windows (`--since`, `--until`),
   server-side ordering (`--sort`, `--order`), and field projection (`--fields`
   or the `--brief` shorthand) to avoid full-history scans and oversized pages.
@@ -34,6 +37,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
 
 ### Changed
+- `ark tasks list --all` now follows `meta.next_cursor` until all matching tasks
+  are returned instead of silently truncating the result to one page of 100.
 - `ark tasks comments post` now uses `--label` as its documented flag, matching
   the `label` field returned by the API. The former `--type` spelling remains a
   hidden compatibility alias. CLI help, `ark skills`, and agent guidance now

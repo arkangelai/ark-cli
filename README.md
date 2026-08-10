@@ -285,6 +285,7 @@ ark tasks list             [--status=] [--priority=] [--factura-key=] [--client-
                            [--since=<iso-date>] [--until=<iso-date>]
                            [--sort=<field>] [--order=asc|desc]
                            [--fields=<comma-separated-fields> | --brief]
+ark tasks stats            # one-request histogram of task counts by status
 ark tasks find <text>      [--limit=20] [--cursor=]
 ark tasks get <id>
 ark tasks create           --title= [--description=] [--priority=] [--deadline=] [--context=] [--status=hold|draft|queued]
@@ -387,7 +388,11 @@ When paginating, pass `meta.next_cursor` back to `--cursor` verbatim.
 |---|---|---|
 | Upload size | 500 MB | Client-side check before hitting the API; override with `ARK_MAX_UPLOAD_BYTES` only when the API/bucket limit changes |
 | JSON payload via `--data` / `--context` | No hard limit | Piped through stdin internally; not subject to OS `ARG_MAX` |
-| Task list size | No hard limit | Use `--limit` and `--cursor` for pagination; add `--brief` or `--fields` to minimize each page |
+| Task list page size | 100 tasks | Use `--limit` and `--cursor` for manual pagination, `--all` to fetch every page, and `--brief` or `--fields` to minimize each page |
+
+`meta.count` reports only the number of tasks in the current list page. For an
+operational overview, use `ark tasks stats`; do not paginate large states just
+to count them.
 
 Earlier versions (< 0.2.5) passed large JSON through shell arguments, which
 could crash on payloads exceeding ~1 MB (the OS `ARG_MAX` limit on macOS).

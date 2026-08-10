@@ -73,6 +73,11 @@ List responses add:
 "meta": { "count": 20, "next_cursor": "2026-04-15T08:30:00Z" }
 ```
 
+`meta.count` is the number of rows in the current page, not the total number of
+matching tasks. Use `ark tasks stats` for a one-request count by status. Use
+`ark tasks list --all` only when the task records themselves are required; it
+follows `meta.next_cursor` until every matching page has been fetched.
+
 Error envelope goes to **stderr**:
 ```json
 {
@@ -181,6 +186,7 @@ Use these to read and mutate task state:
 | Command | Purpose |
 |---|---|
 | `ark tasks list` | List tasks with business-ID filters, time windows, ordering, and field projection |
+| `ark tasks stats` | Count all tasks by status in one request |
 | `ark tasks find <text>` | Search task title and business context; returns ID, status, and title |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |

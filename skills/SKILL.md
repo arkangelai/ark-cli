@@ -165,6 +165,11 @@ TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 This is one atomic operation. Never use `tasks list --limit 1` followed by
 `tasks claim`; two workers can select the same task before either claim lands.
 
+For an operational overview or counts by status, run `ark tasks stats`. It
+returns the complete status histogram in one request. A list response's
+`.meta.count` is only the number of tasks in that page, so never paginate large
+task states merely to count them.
+
 Read from the response:
 - `.data.id` → store as `TASK_ID`. Required for all subsequent commands.
 - `.data.title` → what the task is.
@@ -924,6 +929,7 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 ## Quick Reference
 
 ```
+ark tasks stats                               Count all tasks by status in one request
 ark tasks list --status queued --limit 1      Find available work
 ark tasks list --status blocked --since <iso> --sort created_at --order asc --brief
                                               Scan oldest blockers with a small payload

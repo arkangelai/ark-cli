@@ -506,7 +506,7 @@ validate_task_fields() {
 }
 
 cmd_tasks_list() {
-  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor=""
+  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor="" fetch_all="false"
   local created_after="" created_before="" sort_f="" order_f="" fields_f=""
   local factura_key="" client_ref="" batch_id="" parent_task_id=""
   local brief="false"
@@ -539,7 +539,7 @@ cmd_tasks_list() {
       --fields=*)   fields_f="${1#--fields=}"; require_option_value "--fields" "$fields_f" ;;
       --fields)     [[ $# -ge 2 ]] || require_option_value "--fields" ""; shift; fields_f="$1"; require_option_value "--fields" "$fields_f" ;;
       --brief)      brief="true" ;;
-      --all)        limit=100 ;;
+      --all)        fetch_all="true"; limit=100 ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
@@ -558,34 +558,81 @@ cmd_tasks_list() {
   [[ "$brief" == "true" ]] && fields_f="$BRIEF_TASK_FIELDS"
   [[ -n "$fields_f" ]] && validate_task_fields "$fields_f"
 
-  local q=""
-  q=$(append_query_param "$q" "limit" "$limit")
-  [[ -n "$status_f" ]]       && q=$(append_query_param "$q" "status" "$status_f")
-  [[ -n "$priority_f" ]]     && q=$(append_query_param "$q" "priority" "$priority_f")
-  [[ -n "$factura_key" ]]    && q=$(append_query_param "$q" "factura_key" "$factura_key")
-  [[ -n "$client_ref" ]]     && q=$(append_query_param "$q" "client_ref" "$client_ref")
-  [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
-  [[ -n "$parent_task_id" ]] && q=$(append_query_param "$q" "parent_task_id" "$parent_task_id")
-  [[ -n "$cursor" ]]         && q=$(append_query_param "$q" "cursor" "$cursor")
-  [[ -n "$created_after" ]]  && q=$(append_query_param "$q" "created_after" "$created_after")
-  [[ -n "$created_before" ]] && q=$(append_query_param "$q" "created_before" "$created_before")
-  [[ -n "$sort_f" ]]         && q=$(append_query_param "$q" "sort" "$sort_f")
-  [[ -n "$order_f" ]]        && q=$(append_query_param "$q" "order" "$order_f")
-  [[ -n "$fields_f" ]]       && q=$(append_query_param "$q" "fields" "$fields_f")
+  local data="[]" meta="{}" page_cursor="$cursor" total_count=0
+  while true; do
+    local q=""
+    q=$(append_query_param "$q" "limit" "$limit")
+    [[ -n "$status_f" ]]       && q=$(append_query_param "$q" "status" "$status_f")
+    [[ -n "$priority_f" ]]     && q=$(append_query_param "$q" "priority" "$priority_f")
+    [[ -n "$factura_key" ]]    && q=$(append_query_param "$q" "factura_key" "$factura_key")
+    [[ -n "$client_ref" ]]     && q=$(append_query_param "$q" "client_ref" "$client_ref")
+    [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
+    [[ -n "$parent_task_id" ]] && q=$(append_query_param "$q" "parent_task_id" "$parent_task_id")
+    [[ -n "$page_cursor" ]]    && q=$(append_query_param "$q" "cursor" "$page_cursor")
+    [[ -n "$created_after" ]]  && q=$(append_query_param "$q" "created_after" "$created_after")
+    [[ -n "$created_before" ]] && q=$(append_query_param "$q" "created_before" "$created_before")
+    [[ -n "$sort_f" ]]         && q=$(append_query_param "$q" "sort" "$sort_f")
+    [[ -n "$order_f" ]]        && q=$(append_query_param "$q" "order" "$order_f")
+    [[ -n "$fields_f" ]]       && q=$(append_query_param "$q" "fields" "$fields_f")
 
-  http_request "GET" "/api/tasks?${q}"
-  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+    http_request "GET" "/api/tasks?${q}"
+    [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
-  local data meta
-  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
-  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+    local page_data page_meta
+    page_data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+    page_meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+    if [[ "$fetch_all" != "true" ]]; then
+      data="$page_data"
+      meta="$page_meta"
+      break
+    fi
+
+    data=$(printf '%s\n%s\n' "$data" "$page_data" | jq -cs '.[0] + .[1]')
+    total_count=$(printf '%s' "$data" | jq 'length')
+
+    local next_cursor
+    next_cursor=$(printf '%s' "$page_meta" | jq -r '.next_cursor // empty')
+    if [[ -z "$next_cursor" ]]; then
+      meta=$(printf '%s' "$page_meta" | jq -c --argjson count "$total_count" \
+        '. + {count:$count,next_cursor:null}')
+      break
+    fi
+    if [[ "$next_cursor" == "$page_cursor" ]]; then
+      err_json "pagination_stalled" "API returned the same next_cursor twice" "false" \
+        "$(jq -n --arg cursor "$next_cursor" '{cursor:$cursor}')" \
+        "Retry without --all and inspect meta.next_cursor"
+      exit 1
+    fi
+    page_cursor="$next_cursor"
+  done
 
   if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
-    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.status)] \(.id) — \(.title)"'
+    printf '%s' "$data" | jq -r '.[] | "[\(.status)] \(.id) — \(.title)"'
     echo "count: $(printf '%s' "$meta" | jq -r '.count // 0')"
     return
   fi
   ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks stats ───────────────────────────────────────────────────────────────
+cmd_tasks_stats() {
+  if [[ $# -gt 0 ]]; then
+    err_json "bad_argument" "tasks stats does not accept arguments" "false" "{}" "ark tasks stats"
+    exit 2
+  fi
+
+  http_request "GET" "/api/tasks/stats"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r 'to_entries[] | "\(.key): \(.value)"'
+    return
+  fi
+  ok_response "$data" "{}" "{}"
 }
 
 # ─── tasks find ────────────────────────────────────────────────────────────────
@@ -2404,6 +2451,10 @@ cmd_skills() {
     cli_version: $v,
     data: {
       workflows: {
+        operational_overview: [
+          "ark tasks stats",
+          "# Use stats for counts. Do not paginate task lists merely to count statuses."
+        ],
         query_tasks_efficiently: [
           "ark tasks list --status blocked --since 2026-08-01 --until 2026-08-10 --brief",
           "ark tasks list --status blocked --sort created_at --order asc --fields id,status,title,created_at",
@@ -2624,7 +2675,7 @@ cmd_skills() {
         next_commands:    "ready-to-run Tasks Ark CLI commands keyed by action name",
         idempotent_replay:"boolean — true when response came from idempotency cache",
         request_id:       "uuid for log correlation with API",
-        meta:             "(list responses only) count and next_cursor"
+        meta:             "(list responses only) count for this page and next_cursor; use ark tasks stats for totals"
       },
       task_types: {
         "general":             "Razona y ejecuta con instrucciones en context. Usar workflow execute_queued_task.",
@@ -2770,6 +2821,8 @@ TASKS
     [--limit=20]  [--cursor=<opaque>]  [--all]
     [--since=<iso-date>]  [--until=<iso-date>]  [--sort=<field>]  [--order=asc|desc]
     [--fields=id,status,title,created_at | --brief]
+    --all follows pagination until every matching task has been fetched
+  ark tasks stats                    Count tasks by status in one request
   ark tasks find <text>              Find tasks by business identifier or title
     [--limit=20]  [--cursor=<cursor>]
   ark tasks get <id>                 Fetch a single task with next_commands
@@ -2947,6 +3000,7 @@ main() {
       local sub="${1:-}"; shift || true
       case "$sub" in
         list)     cmd_tasks_list "$@" ;;
+        stats)    cmd_tasks_stats "$@" ;;
         find)     cmd_tasks_find "$@" ;;
         get)      cmd_tasks_get "$@" ;;
         create)   cmd_tasks_create "$@" ;;
