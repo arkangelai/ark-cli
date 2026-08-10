@@ -8,6 +8,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks claim-next [--task-type]` — atomically claims the next
+  profile-eligible task, removing the `list` + `claim` race between workers.
+- `ark tasks ask-review <id> [--reason]` — requests human review without
+  completing the task or manipulating its confidence score.
+- `ark batches status <batch-id> [--missing-limit]` — reads bulk-ingest status.
+- `ark tasks inputs ocr <id> <input-id>` — fetches OCR data for an input.
+- `ark reps prestadores|servicios|habilitacion` — exposes REPS provider,
+  service, and habilitation lookups with API-supported filters.
 - `ark tasks ingest-dir <dir>` — bulk directory ingestion where each
   subdirectory is a case/task. Supports `--map subdir-as-case`, `--task-type`,
   `--status`, `--priority`, `--batch-id`, bounded upload concurrency,
