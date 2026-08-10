@@ -119,9 +119,11 @@ Generate one `TASK_RUN_ID` at the start of each execution run. Derive per-action
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)
 
-# Claim
+# Atomically claim the next profile-eligible queued task
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+[[ -n "$TASK_ID" ]] || exit 0
 
 # Set workspace
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
@@ -146,6 +148,27 @@ A re-queued task starts a new execution run — generate a fresh `TASK_RUN_ID`.
 
 ---
 
+## Resource Field Names
+
+Use these exact response fields when filtering JSON:
+
+| Resource | Category/type field | Related field |
+|---|---|---|
+| comments | `label` | `author_type` |
+| outputs | `output_type` | `label` |
+| events | `actor_type` | — |
+| tasks | `task_type` | `created_by_type` |
+
+Post comments with `--label`; the legacy `--type` spelling is accepted only as
+a compatibility alias. For example:
+
+```bash
+ark tasks comments post "$TASK_ID" --label blocker --body "Missing OCR"
+ark tasks comments list "$TASK_ID" | jq '.data[] | select(.label == "blocker")'
+```
+
+---
+
 ## Confidence Routing
 
 `ark tasks complete` routes automatically:
@@ -166,6 +189,8 @@ Use these to read and mutate task state:
 | `ark tasks stats` | Count all tasks by status in one request |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |
+| `ark tasks claim-next [--task-type]` | Atomically claim the next profile-eligible queued task |
+| `ark tasks ask-review <id> [--reason]` | Request human review without completing the task |
 | `ark tasks status <id> --status draft` | Release a held task into draft/OCR |
 | `ark tasks update <id> --log-path` | Set workspace storage path |
 | `ark tasks context-set <id> --set key=value` | **Merge fields into context** (preserves existing fields) |
@@ -175,6 +200,9 @@ Use these to read and mutate task state:
 | `ark tasks block <id> --reason` | Signal blocker, transition to blocked |
 | `ark tasks comments post <id>` | Post a note or blocker comment |
 | `ark tasks inputs list <id>` | List task inputs |
+| `ark tasks inputs ocr <id> <input-id>` | Fetch OCR data for an input |
+| `ark batches status <batch-id>` | Read bulk-ingest status and missing inputs |
+| `ark reps prestadores\|servicios\|habilitacion` | Query the REPS provider and service registry |
 | `ark tasks create` | Create a follow-on task |
 | `ark learnings files list` | List learnings (operacional, negocio) |
 | `ark learnings files url <path> <name>` | Download a learning file (signed URL) |
@@ -204,15 +232,13 @@ export ARK_API_URL="${ARK_API_URL:-http://localhost:3000}"
 
 TASK_RUN_ID=$(ark gen-uuid)
 
-# Pick up a queued task
-TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].id')
-if [[ -z "$TASK_ID" || "$TASK_ID" == "null" ]]; then
-  echo '{"ok":false,"error":"No queued tasks"}' >&2; exit 0
-fi
-
-# Claim
+# Atomically pick up and claim a queued task
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+if [[ -z "$TASK_ID" ]]; then
+  echo '{"ok":false,"error":"No eligible queued tasks"}' >&2; exit 0
+fi
 
 # Set workspace
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
@@ -230,12 +256,12 @@ DESCRIPTION=$(echo "$TASK" | jq -r '.data.description')
 
 # Post a progress note
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note"
-ark tasks comments post "$TASK_ID" --type note --body "Completed analysis. Writing report."
+ark tasks comments post "$TASK_ID" --label note --body "Completed analysis. Writing report."
 
 # Determine confidence and post rationale as a comment
 CONFIDENCE=0.92
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Verified findings against source data; no unresolved edge cases."
 
 # Write the final output in the format the task context requires
@@ -316,7 +342,7 @@ LOG_PATH=$(echo "$TASK" | jq -r '.data.log_path')
 # Re-determine confidence and post rationale as a comment
 CONFIDENCE=0.90
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Addressed human feedback; <what changed and why>."
 
 # Write the revised output in the format the task context requires
@@ -380,16 +406,15 @@ tasks may be re-queued.
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)
 
-TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].id')
-TASK_TYPE=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].task_type')
+# Claim atomically, then inspect the returned task type.
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
+CLAIM=$(ark tasks claim-next --task-type batch-denial-mail)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+TASK_TYPE=$(printf '%s' "$CLAIM" | jq -r '.data.task_type // empty')
 
 if [[ "$TASK_TYPE" != "batch-denial-mail" ]]; then
   echo '{"ok":false,"error":"task_type no es batch-denial-mail"}' >&2; exit 1
 fi
-
-# Claim
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
 
 # Ejecutar el script — sin razonamiento, sin interpretación
 STDERR_FILE=$(mktemp)
@@ -413,7 +438,7 @@ if ark audit send-denial-mail "$TASK_ID" 2>"$STDERR_FILE"; then
   # Registrar fallos parciales como nota — no bloquear el flujo
   if [[ ${#PATCH_ERRORS[@]} -gt 0 ]]; then
     export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:patch-errors"
-    ark tasks comments post "$TASK_ID" --type note \
+    ark tasks comments post "$TASK_ID" --label note \
       --body "PATCH reply_sent falló para las siguientes tareas eps_audit: ${PATCH_ERRORS[*]}"
   fi
 
@@ -426,7 +451,7 @@ else
 
   # Postear stderr como nota antes de bloquear
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note"
-  ark tasks comments post "$TASK_ID" --type note --body "$STDERR_CONTENT"
+  ark tasks comments post "$TASK_ID" --label note --body "$STDERR_CONTENT"
 
   # Bloquear con razón estructurada
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:block"

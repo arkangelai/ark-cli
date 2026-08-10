@@ -81,10 +81,12 @@ ark tasks status "$TASK_ID" --status draft
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)
 
-TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].id')
-
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+
+# Empty means no profile-eligible queued task is currently available.
+[[ -n "$TASK_ID" ]] || exit 0
 ```
 
 **2. Set up workspace and read inputs**
@@ -98,7 +100,7 @@ ark tasks inputs list "$TASK_ID"   # paths the human declared for this task
 **3. Do the work — post notes, register new sources**
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:1"
-ark tasks comments post "$TASK_ID" --type note --body "Analysis in progress."
+ark tasks comments post "$TASK_ID" --label note --body "Analysis in progress."
 
 # If a new data source is discovered during execution:
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:input:1"
@@ -167,6 +169,12 @@ ark tasks release-batch --batch-id carga-soat-2026-07 --limit 100
 ```
 
 `release-batch` is also human-only; agent keys receive `403 forbidden` by design.
+
+Track ingest progress without scanning tasks:
+
+```bash
+ark batches status carga-soat-2026-07 --missing-limit 100
+```
 
 **5. Complete with a confidence score**
 ```bash
@@ -256,6 +264,8 @@ ark tasks context <id>     --data='<json>' | --clear          # human only
 ark tasks context-set <id> --set key=value [--set key2=val2]  # agent only, shallow merge
 ark tasks status <id>      --status= [--confidence=] [--comment-id=]
 ark tasks claim <id>
+ark tasks claim-next        [--task-type=]
+ark tasks ask-review <id>   [--reason=]
 ark tasks complete <id>    --confidence=
 ark tasks block <id>       --reason=
 ark tasks delete <id>
@@ -268,8 +278,18 @@ ark tasks events <id>
 ark tasks inputs list <id>
 ark tasks inputs add <id>  --path= [--type=filesystem|storage|url] [--description=]
 ark tasks inputs remove <id> <input-id>
+ark tasks inputs ocr <id> <input-id>
+ark batches status <batch-id> [--missing-limit=]
+ark reps prestadores       [--codigo-habilitacion=] [--nit=] [--razon-social=] [--nombre=]
+                           [--departamento=] [--municipio=] [--habilitado=SI|NO]
+                           [--nivel=] [--naturaleza-juridica=] [--limit=] [--offset=]
+ark reps servicios         [--codigo-habilitacion=] [--numero-sede=] [--serv-codigo=]
+                           [--serv-nombre=] [--grupo-servicio=] [--departamento=]
+                           [--municipio=] [--habilitado=SI|NO] [--complejidad=]
+                           [--modalidad=] [--limit=] [--offset=]
+ark reps habilitacion <codigo>
 ark tasks comments list <id>
-ark tasks comments post <id>     --type=note|blocker|comment|approved|changes_requested --body=
+ark tasks comments post <id>     --label=note|blocker|comment|approved|changes_requested --body=
 ark tasks comments edit <id> <comment-id>   --body=
 ark tasks comments delete <id> <comment-id>
 ark tasks outputs list <id>
@@ -294,6 +314,21 @@ ark version
 ```
 
 Global flags: `--human` (readable output), `--dry-run` (no side effects).
+
+### JSON field names
+
+Use the response field names below when filtering CLI JSON. In particular,
+comments use `label`, matching the canonical `comments post --label` flag.
+
+| Resource | Category/type field | Related field |
+|---|---|---|
+| comments | `label` | `author_type` |
+| outputs | `output_type` | `label` |
+| events | `actor_type` | — |
+| tasks | `task_type` | `created_by_type` |
+
+The former `comments post --type` spelling remains accepted as a compatibility
+alias, but is intentionally omitted from help and examples.
 
 Run `ark --help` for the full reference including flags, environment variables,
 and exit codes.
