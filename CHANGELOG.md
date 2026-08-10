@@ -8,6 +8,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks claim-next [--task-type]` — atomically claims the next
+  profile-eligible task, removing the `list` + `claim` race between workers.
+- `ark tasks ask-review <id> [--reason]` — requests human review without
+  completing the task or manipulating its confidence score.
+- `ark batches status <batch-id> [--missing-limit]` — reads bulk-ingest status.
+- `ark tasks inputs ocr <id> <input-id>` — fetches OCR data for an input.
+- `ark reps prestadores|servicios|habilitacion` — exposes REPS provider,
+  service, and habilitation lookups with API-supported filters.
 - `ark tasks ingest-dir <dir>` — bulk directory ingestion where each
   subdirectory is a case/task. Supports `--map subdir-as-case`, `--task-type`,
   `--status`, `--priority`, `--batch-id`, bounded upload concurrency,
@@ -18,6 +26,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
 
 ### Changed
+- `ark tasks comments post` now uses `--label` as its documented flag, matching
+  the `label` field returned by the API. The former `--type` spelling remains a
+  hidden compatibility alias. CLI help, `ark skills`, and agent guidance now
+  document the exact category/type fields for comments, outputs, events, and tasks.
 - Raised the default client-side upload ceiling from 50 MB to 500 MB for task
   inputs, outputs, knowledge uploads, and bulk ingestion. The limit can still be
   overridden with `ARK_MAX_UPLOAD_BYTES` if the backend limit changes.
@@ -28,6 +40,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - URL-encoded every `ark tasks list` query value so opaque pagination cursors
   containing `+` reach the API verbatim instead of being decoded as spaces.
+- Masked `api-key` values in `ark config set` output so setup logs and agent
+  transcripts no longer expose the configured secret.
 
 ---
 

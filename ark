@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ARK_VERSION="0.5.0"
-ARK_CONFIG_FILE="${HOME}/.config/ark/config"
+ARK_CONFIG_FILE="${ARK_CONFIG_FILE:-${HOME}/.config/ark/config}"
 ARK_DEFAULT_API_URL="https://audit.arkangel.ai"
 ARK_DEFAULT_LIMIT="20"
 HUMAN_OUTPUT="${HUMAN_OUTPUT:-false}"
@@ -51,6 +51,19 @@ config_set() {
   grep -v "^${1}=" "$ARK_CONFIG_FILE" > "$tmp" 2>/dev/null || true
   echo "${1}=${2}" >> "$tmp"
   mv "$tmp" "$ARK_CONFIG_FILE" && chmod 600 "$ARK_CONFIG_FILE"
+}
+
+config_display_value() {
+  local key="$1" value="$2"
+  if [[ "$key" == "api-key" && -n "$value" ]]; then
+    if [[ ${#value} -le 4 ]]; then
+      printf '%s' '***'
+    else
+      printf '%s***' "${value:0:4}"
+    fi
+  else
+    printf '%s' "$value"
+  fi
 }
 
 config_del() {
@@ -330,6 +343,7 @@ next_cmds() {
     local cmd
     case "$key" in
       claim)           cmd="ark tasks claim ${id}" ;;
+      ask_review|ask-review) cmd="ark tasks ask-review ${id} --reason \"<reason>\"" ;;
       complete)        cmd="ark tasks complete ${id} --confidence <0.0-1.0>" ;;
       block)           cmd="ark tasks block ${id} --reason \"<reason>\"" ;;
       set_workspace)   cmd="ark tasks update ${id} --log-path \"<storage-path>\"" ;;
@@ -337,14 +351,14 @@ next_cmds() {
       upload_output)   cmd="ark tasks outputs upload ${id} <file-path> --type <type> --label <label>" ;;
       upload_input)    cmd="ark tasks inputs upload ${id} <file-path>" ;;
       document_url)    cmd="ark tasks documents url ${id} <input|output> <record-id>" ;;
-      post_note)       cmd="ark tasks comments post ${id} --type note --body \"<body>\"" ;;
+      post_note)       cmd="ark tasks comments post ${id} --label note --body \"<body>\"" ;;
       register_input)  cmd="ark tasks inputs add ${id} --path \"<path>\"" ;;
       approve)         cmd="ark tasks status ${id} --status done" ;;
       request_changes) cmd="ark tasks status ${id} --status queued --comment-id <comment-id>" ;;
       queue|requeue)   cmd="ark tasks status ${id} --status queued" ;;
       cancel)          cmd="ark tasks status ${id} --status cancelled" ;;
       archive)         cmd="ark tasks status ${id} --status archived" ;;
-      comment)         cmd="ark tasks comments post ${id} --type comment --body \"<body>\"" ;;
+      comment)         cmd="ark tasks comments post ${id} --label comment --body \"<body>\"" ;;
       self)            cmd="ark tasks get ${id}" ;;
       *)               cmd="ark tasks get ${id}" ;;
     esac
@@ -360,8 +374,18 @@ dry_run_response() {
     'input as $body | {ok:true,cli_version:$v,dry_run:true,data:{would_send:{method:$m,path:$p,body:$body}}}'
 }
 
-uri_encode() {
-  jq -rn --arg value "$1" '$value | @uri'
+url_encode() {
+  printf '%s' "$1" | jq -sRr @uri
+}
+
+append_query_param() {
+  local query="$1" key="$2" value="$3"
+  local encoded; encoded=$(url_encode "$value")
+  if [[ -n "$query" ]]; then
+    printf '%s&%s=%s' "$query" "$key" "$encoded"
+  else
+    printf '%s=%s' "$key" "$encoded"
+  fi
 }
 
 # ─── auth ──────────────────────────────────────────────────────────────────────
@@ -417,7 +441,8 @@ cmd_config() {
         exit 2
       }
       config_set "$key" "$value"
-      jq -n --arg v "$ARK_VERSION" --arg k "$key" --arg val "$value" \
+      local display_value; display_value=$(config_display_value "$key" "$value")
+      jq -n --arg v "$ARK_VERSION" --arg k "$key" --arg val "$display_value" \
         '{ok:true,cli_version:$v,data:{key:$k,value:$val}}'
       ;;
     get)
@@ -433,8 +458,7 @@ cmd_config() {
     list)
       local url; url=$(config_get "url")
       local raw_key; raw_key=$(config_get "api-key")
-      local masked_key=""
-      [[ -n "$raw_key" ]] && masked_key="${raw_key:0:4}***"
+      local masked_key; masked_key=$(config_display_value "api-key" "$raw_key")
       jq -n --arg v "$ARK_VERSION" \
         --arg url "${url:-}" \
         --arg key "${masked_key}" \
@@ -461,10 +485,10 @@ cmd_tasks_list() {
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  local q="?limit=$(uri_encode "$limit")"
-  [[ -n "$status_f" ]]   && q+="&status=$(uri_encode "$status_f")"
-  [[ -n "$priority_f" ]] && q+="&priority=$(uri_encode "$priority_f")"
-  [[ -n "$cursor" ]]     && q+="&cursor=$(uri_encode "$cursor")"
+  local q="?limit=$(url_encode "$limit")"
+  [[ -n "$status_f" ]]   && q+="&status=$(url_encode "$status_f")"
+  [[ -n "$priority_f" ]] && q+="&priority=$(url_encode "$priority_f")"
+  [[ -n "$cursor" ]]     && q+="&cursor=$(url_encode "$cursor")"
 
   http_request "GET" "/api/tasks${q}"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
@@ -741,6 +765,68 @@ cmd_tasks_claim() {
   local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
   http_request "PATCH" "/api/tasks/${id}/status" "$body" "$ikey"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  cmds=$(next_cmds "$id" "$links")
+  ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks claim-next / ask-review ─────────────────────────────────────────────
+cmd_tasks_claim_next() {
+  local task_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --task-type=*) task_type="${1#--task-type=}" ;;
+      --task-type)   shift; task_type="${1:-}" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks claim-next [--task-type=<type>]"; exit 2 ;;
+    esac
+    shift || true
+  done
+
+  local endpoint="/api/tasks/claim-next"
+  [[ -n "$task_type" ]] && endpoint="${endpoint}?task_type=$(url_encode "$task_type")"
+
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "$endpoint"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "$endpoint" "" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data links id cmds
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
+  id=$(printf '%s' "$data" | jq -r '.id // ""')
+  if [[ -n "$id" ]]; then
+    cmds=$(next_cmds "$id" "$links")
+  else
+    cmds="{}"
+  fi
+  ok_response "$data" "$links" "$cmds"
+}
+
+cmd_tasks_ask_review() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks ask-review <id> [--reason=<reason>]"; exit 2; }
+
+  local reason="Human review requested."
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason=*) reason="${1#--reason=}" ;;
+      --reason)   shift; reason="${1:-}" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks ask-review ${id} [--reason=<reason>]"; exit 2 ;;
+    esac
+    shift || true
+  done
+  [[ -n "$reason" ]] || { err_json "bad_argument" "--reason cannot be empty" "false" "{}" "ark tasks ask-review ${id} [--reason=<reason>]"; exit 2; }
+
+  local body; body=$(jq -n --arg body "$reason" '{body:$body}')
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/ask-review" "$body"; return; }
+
+  local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
+  http_request "POST" "/api/tasks/${id}/ask-review" "$body" "$ikey"
+  [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
   local data links cmds
   data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
@@ -1353,7 +1439,36 @@ cmd_tasks_release_batch() {
   ok_response "$data" "{}" "{}"
 }
 
-# ─── tasks inputs remove ───────────────────────────────────────────────────────
+# ─── batches status ─────────────────────────────────────────────────────────────
+cmd_batches_status() {
+  local batch_id="${1:-}"; shift || true
+  [[ -z "$batch_id" ]] && { err_json "bad_argument" "Batch ID required" "false" "{}" "ark batches status <batch-id> [--missing-limit=<N>]"; exit 2; }
+
+  local missing_limit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --missing-limit=*) missing_limit="${1#--missing-limit=}" ;;
+      --missing-limit)   shift; missing_limit="${1:-}" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark batches status <batch-id> [--missing-limit=<N>]"; exit 2 ;;
+    esac
+    shift || true
+  done
+  if [[ -n "$missing_limit" && (! "$missing_limit" =~ ^[0-9]+$ || "$missing_limit" -lt 1 || "$missing_limit" -gt 1000) ]]; then
+    err_json "bad_argument" "--missing-limit must be an integer between 1 and 1000" "false" "{}" ""; exit 2
+  fi
+
+  local endpoint="/api/batches/$(url_encode "$batch_id")/status"
+  [[ -n "$missing_limit" ]] && endpoint="${endpoint}?missing_limit=${missing_limit}"
+  http_request "GET" "$endpoint"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks inputs remove / ocr ─────────────────────────────────────────────────
 cmd_tasks_inputs_remove() {
   local id="${1:-}" input_id="${2:-}"
   [[ -z "$id" || -z "$input_id" ]] && { err_json "bad_argument" "Task ID and input ID required" "false" "{}" "ark tasks inputs remove <id> <input-id>"; exit 2; }
@@ -1364,6 +1479,17 @@ cmd_tasks_inputs_remove() {
   [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "204" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
   local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}' 2>/dev/null || echo '{}')
+  ok_response "$data" "{}" "{}"
+}
+
+cmd_tasks_inputs_ocr() {
+  local id="${1:-}" input_id="${2:-}"
+  [[ -z "$id" || -z "$input_id" ]] && { err_json "bad_argument" "Task ID and input ID required" "false" "{}" "ark tasks inputs ocr <id> <input-id>"; exit 2; }
+
+  http_request "GET" "/api/tasks/$(url_encode "$id")/inputs/$(url_encode "$input_id")/ocr"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
   ok_response "$data" "{}" "{}"
 }
 
@@ -1389,11 +1515,14 @@ cmd_tasks_comments_list() {
 # ─── tasks comments post ───────────────────────────────────────────────────────
 cmd_tasks_comments_post() {
   local id="${1:-}"; shift || true
-  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks comments post <id> --type <type> --body <body>"; exit 2; }
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks comments post <id> --label <label> --body <body>"; exit 2; }
 
   local label="" body_text=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --label=*) label="${1#--label=}" ;;
+      --label)   shift; label="$1" ;;
+      # Backward-compatible alias. Keep hidden from help so new callers use the API field name.
       --type=*) label="${1#--type=}" ;;
       --type)   shift; label="$1" ;;
       --body=*) body_text="${1#--body=}" ;;
@@ -1401,7 +1530,7 @@ cmd_tasks_comments_post() {
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  [[ -z "$label" || -z "$body_text" ]] && { err_json "bad_argument" "--type and --body are required" "false" "{}" "ark tasks comments post ${id} --type <type> --body \"<body>\""; exit 2; }
+  [[ -z "$label" || -z "$body_text" ]] && { err_json "bad_argument" "--label and --body are required" "false" "{}" "ark tasks comments post ${id} --label <label> --body \"<body>\""; exit 2; }
 
   local body; body=$(jq -n --arg b "$body_text" --arg l "$label" '{body:$b,label:$l}')
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/comments" "$body"; return; }
@@ -1607,6 +1736,119 @@ cmd_tasks_documents_url() {
       ;;
     *) err_json "bad_argument" "Unknown documents subcommand: ${sub}. Use: url" "false" "{}" "ark tasks documents url <id> <input|output> <record-id>"; exit 2 ;;
   esac
+}
+
+# ─── knowledge files list ──────────────────────────────────────────────────────
+# ─── REPS ───────────────────────────────────────────────────────────────────────
+emit_reps_search_response() {
+  local endpoint="$1"
+  http_request "GET" "$endpoint"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+cmd_reps_prestadores() {
+  local query="" limit="" offset=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --codigo-habilitacion=*) query=$(append_query_param "$query" "codigo_habilitacion" "${1#--codigo-habilitacion=}") ;;
+      --codigo-habilitacion)   shift; query=$(append_query_param "$query" "codigo_habilitacion" "${1:-}") ;;
+      --nit=*)                 query=$(append_query_param "$query" "nit" "${1#--nit=}") ;;
+      --nit)                   shift; query=$(append_query_param "$query" "nit" "${1:-}") ;;
+      --razon-social=*)        query=$(append_query_param "$query" "razon_social" "${1#--razon-social=}") ;;
+      --razon-social)          shift; query=$(append_query_param "$query" "razon_social" "${1:-}") ;;
+      --nombre=*)              query=$(append_query_param "$query" "nombre" "${1#--nombre=}") ;;
+      --nombre)                shift; query=$(append_query_param "$query" "nombre" "${1:-}") ;;
+      --departamento=*)        query=$(append_query_param "$query" "departamento" "${1#--departamento=}") ;;
+      --departamento)          shift; query=$(append_query_param "$query" "departamento" "${1:-}") ;;
+      --municipio=*)           query=$(append_query_param "$query" "municipio" "${1#--municipio=}") ;;
+      --municipio)             shift; query=$(append_query_param "$query" "municipio" "${1:-}") ;;
+      --habilitado=*)          query=$(append_query_param "$query" "habilitado" "${1#--habilitado=}") ;;
+      --habilitado)            shift; query=$(append_query_param "$query" "habilitado" "${1:-}") ;;
+      --nivel=*)               query=$(append_query_param "$query" "nivel" "${1#--nivel=}") ;;
+      --nivel)                 shift; query=$(append_query_param "$query" "nivel" "${1:-}") ;;
+      --naturaleza-juridica=*) query=$(append_query_param "$query" "naturaleza_juridica" "${1#--naturaleza-juridica=}") ;;
+      --naturaleza-juridica)   shift; query=$(append_query_param "$query" "naturaleza_juridica" "${1:-}") ;;
+      --limit=*)               limit="${1#--limit=}"; query=$(append_query_param "$query" "limit" "$limit") ;;
+      --limit)                 shift; limit="${1:-}"; query=$(append_query_param "$query" "limit" "$limit") ;;
+      --offset=*)              offset="${1#--offset=}"; query=$(append_query_param "$query" "offset" "$offset") ;;
+      --offset)                shift; offset="${1:-}"; query=$(append_query_param "$query" "offset" "$offset") ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark reps prestadores [filters]"; exit 2 ;;
+    esac
+    shift || true
+  done
+
+  if [[ -n "$limit" && (! "$limit" =~ ^[0-9]+$ || "$limit" -lt 1 || "$limit" -gt 100) ]]; then
+    err_json "bad_argument" "--limit must be an integer between 1 and 100" "false" "{}" ""; exit 2
+  fi
+  if [[ -n "$offset" && ! "$offset" =~ ^[0-9]+$ ]]; then
+    err_json "bad_argument" "--offset must be a non-negative integer" "false" "{}" ""; exit 2
+  fi
+
+  local endpoint="/api/reps/prestadores"
+  [[ -n "$query" ]] && endpoint="${endpoint}?${query}"
+  emit_reps_search_response "$endpoint"
+}
+
+cmd_reps_servicios() {
+  local query="" limit="" offset=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --codigo-habilitacion=*) query=$(append_query_param "$query" "codigo_habilitacion" "${1#--codigo-habilitacion=}") ;;
+      --codigo-habilitacion)   shift; query=$(append_query_param "$query" "codigo_habilitacion" "${1:-}") ;;
+      --numero-sede=*)         query=$(append_query_param "$query" "numero_sede" "${1#--numero-sede=}") ;;
+      --numero-sede)           shift; query=$(append_query_param "$query" "numero_sede" "${1:-}") ;;
+      --serv-codigo=*)         query=$(append_query_param "$query" "serv_codigo" "${1#--serv-codigo=}") ;;
+      --serv-codigo)           shift; query=$(append_query_param "$query" "serv_codigo" "${1:-}") ;;
+      --serv-nombre=*)         query=$(append_query_param "$query" "serv_nombre" "${1#--serv-nombre=}") ;;
+      --serv-nombre)           shift; query=$(append_query_param "$query" "serv_nombre" "${1:-}") ;;
+      --grupo-servicio=*)      query=$(append_query_param "$query" "grupo_servicio" "${1#--grupo-servicio=}") ;;
+      --grupo-servicio)        shift; query=$(append_query_param "$query" "grupo_servicio" "${1:-}") ;;
+      --departamento=*)        query=$(append_query_param "$query" "departamento" "${1#--departamento=}") ;;
+      --departamento)          shift; query=$(append_query_param "$query" "departamento" "${1:-}") ;;
+      --municipio=*)           query=$(append_query_param "$query" "municipio" "${1#--municipio=}") ;;
+      --municipio)             shift; query=$(append_query_param "$query" "municipio" "${1:-}") ;;
+      --habilitado=*)          query=$(append_query_param "$query" "habilitado" "${1#--habilitado=}") ;;
+      --habilitado)            shift; query=$(append_query_param "$query" "habilitado" "${1:-}") ;;
+      --complejidad=*)         query=$(append_query_param "$query" "complejidad" "${1#--complejidad=}") ;;
+      --complejidad)           shift; query=$(append_query_param "$query" "complejidad" "${1:-}") ;;
+      --modalidad=*)           query=$(append_query_param "$query" "modalidad" "${1#--modalidad=}") ;;
+      --modalidad)             shift; query=$(append_query_param "$query" "modalidad" "${1:-}") ;;
+      --limit=*)               limit="${1#--limit=}"; query=$(append_query_param "$query" "limit" "$limit") ;;
+      --limit)                 shift; limit="${1:-}"; query=$(append_query_param "$query" "limit" "$limit") ;;
+      --offset=*)              offset="${1#--offset=}"; query=$(append_query_param "$query" "offset" "$offset") ;;
+      --offset)                shift; offset="${1:-}"; query=$(append_query_param "$query" "offset" "$offset") ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark reps servicios [filters]"; exit 2 ;;
+    esac
+    shift || true
+  done
+
+  if [[ -n "$limit" && (! "$limit" =~ ^[0-9]+$ || "$limit" -lt 1 || "$limit" -gt 100) ]]; then
+    err_json "bad_argument" "--limit must be an integer between 1 and 100" "false" "{}" ""; exit 2
+  fi
+  if [[ -n "$offset" && ! "$offset" =~ ^[0-9]+$ ]]; then
+    err_json "bad_argument" "--offset must be a non-negative integer" "false" "{}" ""; exit 2
+  fi
+
+  local endpoint="/api/reps/servicios"
+  [[ -n "$query" ]] && endpoint="${endpoint}?${query}"
+  emit_reps_search_response "$endpoint"
+}
+
+cmd_reps_habilitacion() {
+  local codigo="${1:-}"
+  [[ -z "$codigo" ]] && { err_json "bad_argument" "Habilitacion code required" "false" "{}" "ark reps habilitacion <codigo>"; exit 2; }
+  [[ $# -eq 1 ]] || { err_json "bad_argument" "Unknown: ${2:-}" "false" "{}" "ark reps habilitacion <codigo>"; exit 2; }
+
+  http_request "GET" "/api/reps/habilitacion/$(url_encode "$codigo")"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  ok_response "$data" "{}" "{}"
 }
 
 # ─── knowledge files list ──────────────────────────────────────────────────────
@@ -2042,9 +2284,10 @@ cmd_skills() {
       workflows: {
         execute_queued_task: [
           "TASK_RUN_ID=$(ark gen-uuid)",
-          "TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r \".data[0].id\")",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:claim\"",
-          "ark tasks claim \"$TASK_ID\"",
+          "CLAIM=$(ark tasks claim-next)",
+          "TASK_ID=$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \".data.id // empty\")",
+          "# If TASK_ID is empty, no eligible queued task is available; exit gracefully",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:workspace\"",
           "ark tasks update \"$TASK_ID\" --log-path \"storage://tasks/${TASK_ID}/workspace/\"",
           "ark tasks inputs list \"$TASK_ID\" | jq -r \".data[].path\"",
@@ -2099,16 +2342,31 @@ cmd_skills() {
         release_batch: [
           "ark tasks release-batch --batch-id carga-soat-2026-07 --limit 100"
         ],
+        batch_status: [
+          "ark batches status carga-soat-2026-07 --missing-limit 100"
+        ],
+        request_human_review: [
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:ask-review\"",
+          "ark tasks ask-review \"$TASK_ID\" --reason \"Need a human decision on the documented edge case\""
+        ],
+        fetch_input_ocr: [
+          "ark tasks inputs ocr \"$TASK_ID\" \"$INPUT_ID\""
+        ],
+        reps_validation: [
+          "ark reps prestadores --nit 900123456 --habilitado SI",
+          "ark reps servicios --codigo-habilitacion 0500100003 --serv-codigo 123 --habilitado SI",
+          "ark reps habilitacion 0500100003"
+        ],
         fetch_document_url: [
           "# Get a short-lived signed URL (~1h) to download a stored input or output",
           "ark tasks documents url \"$TASK_ID\" output \"$OUTPUT_ID\" | jq -r '.data.url'"
         ],
         batch_denial_mail: [
-          "# Paso 1 — detectar que la tarea es de tipo batch-denial-mail",
-          "ark tasks list --status queued --limit 1 | jq -r \".data[0].task_type\"",
-          "# Paso 2 — tomar la tarea",
+          "# Paso 1 — tomar atómicamente una tarea del tipo esperado",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:claim\"",
-          "ark tasks claim \"$TASK_ID\"",
+          "CLAIM=$(ark tasks claim-next --task-type batch-denial-mail)",
+          "TASK_ID=$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \".data.id // empty\")",
+          "test \"$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \".data.task_type\")\" = \"batch-denial-mail\"",
           "# Paso 3 — ejecutar el script (NO hacer esto manualmente)",
           "RESULT=$(ark audit send-denial-mail \"$TASK_ID\")",
           "# Paso 4 — leer stdout para obtener los datos del correo",
@@ -2143,11 +2401,11 @@ cmd_skills() {
           "ark agents heartbeat --agent-id \"$AGENT_ID\" --metadata \u0027{\"cpu\":45,\"memory_mb\":512}\u0027"
         ],
         batch_preventiva_mail: [
-          "# Paso 1 — detectar que la tarea es de tipo hospital_preventiva_batch_mail",
-          "ark tasks list --status queued --limit 1 | jq -r \".data[0].task_type\"",
-          "# Paso 2 — tomar la tarea",
+          "# Paso 1 — tomar atómicamente una tarea del tipo esperado",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:claim\"",
-          "ark tasks claim \"$TASK_ID\"",
+          "CLAIM=$(ark tasks claim-next --task-type hospital_preventiva_batch_mail)",
+          "TASK_ID=$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \".data.id // empty\")",
+          "test \"$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \".data.task_type\")\" = \"hospital_preventiva_batch_mail\"",
           "# Paso 3 — ejecutar el script (NO hacer esto manualmente)",
           "RESULT=$(ark audit send-preventiva-mail \"$TASK_ID\")",
           "# Paso 4 — leer stdout para obtener los datos del correo",
@@ -2178,6 +2436,7 @@ cmd_skills() {
         ARK_FORMAT:          "json | human (default: json)",
         ARK_DEBUG:           "0 | 1 | 2 (default: 0)",
         ARK_IDEMPOTENCY_KEY: "Reuse to retry a failed action with same key",
+        ARK_CONFIG_FILE:     "Override the config file path (useful for isolated automation/tests)",
         NO_COLOR:                "Disable ANSI colors"
       },
       idempotency_strategy: {
@@ -2187,9 +2446,27 @@ cmd_skills() {
       },
       enums: {
         task_status:  ["hold","draft","queued","in_progress","blocked","review","done","archived","cancelled"],
+        comment_label: ["note","blocker","comment","approved","changes_requested"],
         output_type:  ["json","text","file","screenshot","log"],
         output_label: ["report","artifact","error_log","progress","diff"],
         path_type:    ["filesystem","storage","url"]
+      },
+      resource_fields: {
+        comments: {
+          label: "comment category; set with comments post --label",
+          author_type: "comment author kind"
+        },
+        outputs: {
+          output_type: "deliverable format; set with outputs submit/upload --type",
+          label: "deliverable role; set with outputs submit/upload --label"
+        },
+        events: {
+          actor_type: "event actor kind"
+        },
+        tasks: {
+          task_type: "task workflow kind",
+          created_by_type: "task creator kind"
+        }
       },
       upload_limits: {
         max_file_bytes: 524288000,
@@ -2370,6 +2647,10 @@ TASKS
     --status=<status>  [--confidence=]  [--comment-id=]
     release hold with --status=draft
   ark tasks claim <id>               Transition queued → in_progress
+  ark tasks claim-next               Atomically claim the next eligible queued task
+    [--task-type=<type>]
+  ark tasks ask-review <id>          Request human review without completing the task
+    [--reason=<reason>]
   ark tasks complete <id>            Transition to done (>=0.85) or review (<0.85)
     --confidence=<0.0-1.0>
   ark tasks block <id>               Post blocker comment + transition → blocked
@@ -2393,11 +2674,28 @@ INPUTS
   ark tasks inputs upload <id> <file-path>    Upload a file as an input (≤ 500 MB)
     [--description=]  [--local-path=]  [--path-type=filesystem|storage|url]
   ark tasks inputs remove <id> <input-id>   Remove a human-registered input
+  ark tasks inputs ocr <id> <input-id>      Fetch OCR data for a task input
+
+BATCHES
+  ark batches status <batch-id>      Read bulk-ingest progress
+    [--missing-limit=<1-1000>]
+
+REPS
+  ark reps prestadores               Search healthcare providers
+    [--codigo-habilitacion=] [--nit=] [--razon-social=] [--nombre=]
+    [--departamento=] [--municipio=] [--habilitado=SI|NO] [--nivel=]
+    [--naturaleza-juridica=] [--limit=1-100] [--offset=]
+  ark reps servicios                 Search enabled services by facility
+    [--codigo-habilitacion=] [--numero-sede=] [--serv-codigo=] [--serv-nombre=]
+    [--grupo-servicio=] [--departamento=] [--municipio=] [--habilitado=SI|NO]
+    [--complejidad=baja|media|alta] [--modalidad=intramural|telemedicina|domiciliario]
+    [--limit=1-100] [--offset=]
+  ark reps habilitacion <codigo>     Fetch a provider habilitation dictionary
 
 COMMENTS
   ark tasks comments list <id>       List all comments
   ark tasks comments post <id>       Post a comment
-    --type=note|blocker|comment|approved|changes_requested  --body=<text>
+    --label=note|blocker|comment|approved|changes_requested  --body=<text>
   ark tasks comments edit <id> <comment-id>   Edit own comment body (human only)
     --body=<text>
   ark tasks comments delete <id> <comment-id>  Delete own comment (human only)
@@ -2472,6 +2770,7 @@ ENVIRONMENT
   ARK_FORMAT           json | human
   ARK_DEBUG            0 | 1 | 2  (2 = print full request + response)
   ARK_IDEMPOTENCY_KEY  Reuse this key on retry to get idempotent response
+  ARK_CONFIG_FILE      Override the config file path
   ARK_SCRIPTS_DIR      Override scripts directory (default: <ark-dir>/scripts)
 
 EXIT CODES
@@ -2515,7 +2814,9 @@ main() {
         context)      cmd_tasks_context "$@" ;;
         context-set)  cmd_tasks_context_set "$@" ;;
         status)       cmd_tasks_status "$@" ;;
-        claim)    cmd_tasks_claim "$@" ;;
+        claim)      cmd_tasks_claim "$@" ;;
+        claim-next) cmd_tasks_claim_next "$@" ;;
+        ask-review) cmd_tasks_ask_review "$@" ;;
         complete) cmd_tasks_complete "$@" ;;
         block)    cmd_tasks_block "$@" ;;
         events)   cmd_tasks_events "$@" ;;
@@ -2529,6 +2830,7 @@ main() {
             add)    cmd_tasks_inputs_add "$@" ;;
             upload) cmd_tasks_inputs_upload "$@" ;;
             remove) cmd_tasks_inputs_remove "$@" ;;
+            ocr)    cmd_tasks_inputs_ocr "$@" ;;
             *) err_json "bad_argument" "Unknown inputs subcommand: ${sub2}" "false" "{}" ""; exit 2 ;;
           esac ;;
         comments)
@@ -2551,6 +2853,20 @@ main() {
           esac ;;
         documents) cmd_tasks_documents_url "$@" ;;
         *) err_json "bad_argument" "Unknown tasks subcommand: ${sub}" "false" "{}" "ark help"; exit 2 ;;
+      esac ;;
+    batches)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        status) cmd_batches_status "$@" ;;
+        *) err_json "bad_argument" "Unknown batches subcommand: ${sub}" "false" "{}" "ark batches status <batch-id>"; exit 2 ;;
+      esac ;;
+    reps)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        prestadores)  cmd_reps_prestadores "$@" ;;
+        servicios)    cmd_reps_servicios "$@" ;;
+        habilitacion) cmd_reps_habilitacion "$@" ;;
+        *) err_json "bad_argument" "Unknown reps subcommand: ${sub}" "false" "{}" "ark reps prestadores|servicios|habilitacion"; exit 2 ;;
       esac ;;
     knowledge)
       local sub="${1:-}"; shift || true
