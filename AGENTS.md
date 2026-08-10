@@ -180,7 +180,8 @@ Use these to read and mutate task state:
 
 | Command | Purpose |
 |---|---|
-| `ark tasks list` | Fetch tasks; supports `--since`, `--until`, `--sort`, `--order`, `--fields`, and `--brief` |
+| `ark tasks list` | List tasks with business-ID filters, time windows, ordering, and field projection |
+| `ark tasks find <text>` | Search task title and business context; returns ID, status, and title |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |
 | `ark tasks claim-next [--task-type]` | Atomically claim the next profile-eligible queued task |

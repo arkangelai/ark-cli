@@ -1,7 +1,7 @@
 ---
 status: complete
 priority: p1
-issue_id: "002"
+issue_id: "003"
 tags: [cli, performance, tasks, pagination]
 dependencies: []
 ---
