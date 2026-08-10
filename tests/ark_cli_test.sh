@@ -105,15 +105,15 @@ test_list_all_follows_cursor() {
       HTTP_STATUS="200"
       HTTP_REQUEST_ID="request-list-${request_number}"
       HTTP_IDEMPOTENT_REPLAY="false"
-      if [[ "$2" == "/api/tasks?limit=100&status=review" ]]; then
+      if [[ "$2" == "/api/tasks?limit=100&status=review&factura_key=FE%2057100" ]]; then
         HTTP_BODY='{"ok":true,"data":[{"id":"one"},{"id":"two"}],"meta":{"count":2,"next_cursor":"cursor+2:next"}}'
-      elif [[ "$2" == "/api/tasks?limit=100&status=review&cursor=cursor%2B2%3Anext" ]]; then
+      elif [[ "$2" == "/api/tasks?limit=100&status=review&factura_key=FE%2057100&cursor=cursor%2B2%3Anext" ]]; then
         HTTP_BODY='{"ok":true,"data":[{"id":"three"}],"meta":{"count":1,"next_cursor":null}}'
       else
         return 1
       fi
     }
-    cmd_tasks_list --status review --all
+    cmd_tasks_list --status review --factura-key "FE 57100" --all
   )
 
   assert_jq "$output" '.data | map(.id) == ["one", "two", "three"]'

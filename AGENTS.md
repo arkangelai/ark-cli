@@ -185,8 +185,9 @@ Use these to read and mutate task state:
 
 | Command | Purpose |
 |---|---|
-| `ark tasks list` | Fetch queued tasks |
+| `ark tasks list` | List tasks, optionally filtering by `factura_key`, `client_ref`, `batch_id`, or `parent_task_id` |
 | `ark tasks stats` | Count all tasks by status in one request |
+| `ark tasks find <text>` | Search task title and business context; returns ID, status, and title |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |
 | `ark tasks claim-next [--task-type]` | Atomically claim the next profile-eligible queued task |
