@@ -8,6 +8,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks list` now supports creation-time windows (`--since`, `--until`),
+  server-side ordering (`--sort`, `--order`), and field projection (`--fields`
+  or the `--brief` shorthand) to avoid full-history scans and oversized pages.
 - `ark tasks find <text>` — searches task titles and business context fields
   through `GET /api/tasks/search`, returning task ID, status, and title with
   pagination metadata.

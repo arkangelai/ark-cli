@@ -8,6 +8,7 @@ ARK_DEFAULT_LIMIT="20"
 HUMAN_OUTPUT="${HUMAN_OUTPUT:-false}"
 DRY_RUN=false
 KNOWN_TASK_FIELDS="id title description status priority task_type context deadline_at log_path confidence_score version created_by created_by_type created_at updated_at"
+BRIEF_TASK_FIELDS="id,status,title,created_at"
 
 # ─── Dependencies ──────────────────────────────────────────────────────────────
 check_deps() {
@@ -469,31 +470,94 @@ cmd_config() {
 }
 
 # ─── tasks list ────────────────────────────────────────────────────────────────
+require_option_value() {
+  local option="$1" value="$2"
+  [[ -n "$value" ]] || {
+    err_json "bad_argument" "${option} requires a value" "false" "{}" ""
+    exit 2
+  }
+}
+
+validate_task_fields() {
+  local fields="$1" field
+  local selected_fields=()
+
+  [[ -n "$fields" ]] || {
+    err_json "bad_argument" "--fields requires a comma-separated field list" "false" "{}" \
+      "Example: ark tasks list --fields id,status,title,created_at"
+    exit 2
+  }
+
+  IFS=',' read -r -a selected_fields <<< "$fields"
+  for field in "${selected_fields[@]}"; do
+    if [[ -z "$field" || ! "$field" =~ ^[a-z][a-z0-9_]*$ ]]; then
+      err_json "bad_argument" "Invalid task field: ${field:-<empty>}" "false" \
+        "$(jq -cn --arg field "$field" '{received:$field,format:"lowercase snake_case"}')" \
+        "Use a comma-separated list such as id,status,title,created_at"
+      exit 2
+    fi
+  done
+  if [[ "$fields" == *, ]]; then
+    err_json "bad_argument" "Invalid task field: <empty>" "false" \
+      "$(jq -cn '{received:"",format:"lowercase snake_case"}')" \
+      "Remove the trailing comma from --fields"
+    exit 2
+  fi
+}
+
 cmd_tasks_list() {
   local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor=""
+  local created_after="" created_before="" sort_f="" order_f="" fields_f=""
   local factura_key="" client_ref="" batch_id="" parent_task_id=""
+  local brief="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --status=*)         status_f="${1#--status=}" ;;
-      --status)           shift; status_f="$1" ;;
-      --priority=*)       priority_f="${1#--priority=}" ;;
-      --priority)         shift; priority_f="$1" ;;
-      --factura-key=*)    factura_key="${1#--factura-key=}" ;;
-      --factura-key)      shift; factura_key="$1" ;;
-      --client-ref=*)     client_ref="${1#--client-ref=}" ;;
-      --client-ref)       shift; client_ref="$1" ;;
-      --batch-id=*)       batch_id="${1#--batch-id=}" ;;
-      --batch-id)         shift; batch_id="$1" ;;
-      --parent-task-id=*) parent_task_id="${1#--parent-task-id=}" ;;
-      --parent-task-id)   shift; parent_task_id="$1" ;;
-      --limit=*)          limit="${1#--limit=}" ;;
-      --limit)            shift; limit="$1" ;;
-      --cursor=*)         cursor="${1#--cursor=}" ;;
-      --cursor)           shift; cursor="$1" ;;
-      --all)              limit=100 ;;
+      --status=*)   status_f="${1#--status=}" ;;
+      --status)     [[ $# -ge 2 ]] || { err_json "bad_argument" "--status requires a value" "false" "{}" ""; exit 2; }; shift; status_f="$1" ;;
+      --priority=*) priority_f="${1#--priority=}" ;;
+      --priority)   [[ $# -ge 2 ]] || { err_json "bad_argument" "--priority requires a value" "false" "{}" ""; exit 2; }; shift; priority_f="$1" ;;
+      --factura-key=*) factura_key="${1#--factura-key=}"; require_option_value "--factura-key" "$factura_key" ;;
+      --factura-key) [[ $# -ge 2 ]] || require_option_value "--factura-key" ""; shift; factura_key="$1"; require_option_value "--factura-key" "$factura_key" ;;
+      --client-ref=*) client_ref="${1#--client-ref=}"; require_option_value "--client-ref" "$client_ref" ;;
+      --client-ref) [[ $# -ge 2 ]] || require_option_value "--client-ref" ""; shift; client_ref="$1"; require_option_value "--client-ref" "$client_ref" ;;
+      --batch-id=*) batch_id="${1#--batch-id=}"; require_option_value "--batch-id" "$batch_id" ;;
+      --batch-id) [[ $# -ge 2 ]] || require_option_value "--batch-id" ""; shift; batch_id="$1"; require_option_value "--batch-id" "$batch_id" ;;
+      --parent-task-id=*) parent_task_id="${1#--parent-task-id=}"; require_option_value "--parent-task-id" "$parent_task_id" ;;
+      --parent-task-id) [[ $# -ge 2 ]] || require_option_value "--parent-task-id" ""; shift; parent_task_id="$1"; require_option_value "--parent-task-id" "$parent_task_id" ;;
+      --limit=*)    limit="${1#--limit=}" ;;
+      --limit)      [[ $# -ge 2 ]] || { err_json "bad_argument" "--limit requires a value" "false" "{}" ""; exit 2; }; shift; limit="$1" ;;
+      --cursor=*)   cursor="${1#--cursor=}" ;;
+      --cursor)     [[ $# -ge 2 ]] || { err_json "bad_argument" "--cursor requires a value" "false" "{}" ""; exit 2; }; shift; cursor="$1" ;;
+      --since=*)    created_after="${1#--since=}"; require_option_value "--since" "$created_after" ;;
+      --since)      [[ $# -ge 2 ]] || require_option_value "--since" ""; shift; created_after="$1"; require_option_value "--since" "$created_after" ;;
+      --until=*)    created_before="${1#--until=}"; require_option_value "--until" "$created_before" ;;
+      --until)      [[ $# -ge 2 ]] || require_option_value "--until" ""; shift; created_before="$1"; require_option_value "--until" "$created_before" ;;
+      --sort=*)     sort_f="${1#--sort=}"; require_option_value "--sort" "$sort_f" ;;
+      --sort)       [[ $# -ge 2 ]] || require_option_value "--sort" ""; shift; sort_f="$1"; require_option_value "--sort" "$sort_f" ;;
+      --order=*)    order_f="${1#--order=}"; require_option_value "--order" "$order_f" ;;
+      --order)      [[ $# -ge 2 ]] || require_option_value "--order" ""; shift; order_f="$1"; require_option_value "--order" "$order_f" ;;
+      --fields=*)   fields_f="${1#--fields=}"; require_option_value "--fields" "$fields_f" ;;
+      --fields)     [[ $# -ge 2 ]] || require_option_value "--fields" ""; shift; fields_f="$1"; require_option_value "--fields" "$fields_f" ;;
+      --brief)      brief="true" ;;
+      --all)        limit=100 ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
+
+  if [[ -n "$order_f" && "$order_f" != "asc" && "$order_f" != "desc" ]]; then
+    err_json "bad_argument" "--order must be asc or desc" "false" \
+      "$(jq -cn --arg order "$order_f" '{received:$order,allowed:["asc","desc"]}')" \
+      "Use --order asc or --order desc"
+    exit 2
+  fi
+  if [[ "$brief" == "true" && -n "$fields_f" ]]; then
+    err_json "bad_argument" "--brief and --fields cannot be used together" "false" "{}" \
+      "Use --brief or provide an explicit --fields list"
+    exit 2
+  fi
+  [[ "$brief" == "true" ]] && fields_f="$BRIEF_TASK_FIELDS"
+  [[ -n "$fields_f" ]] && validate_task_fields "$fields_f"
+
   local q=""
   q=$(append_query_param "$q" "limit" "$limit")
   [[ -n "$status_f" ]]       && q=$(append_query_param "$q" "status" "$status_f")
@@ -503,6 +567,11 @@ cmd_tasks_list() {
   [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
   [[ -n "$parent_task_id" ]] && q=$(append_query_param "$q" "parent_task_id" "$parent_task_id")
   [[ -n "$cursor" ]]         && q=$(append_query_param "$q" "cursor" "$cursor")
+  [[ -n "$created_after" ]]  && q=$(append_query_param "$q" "created_after" "$created_after")
+  [[ -n "$created_before" ]] && q=$(append_query_param "$q" "created_before" "$created_before")
+  [[ -n "$sort_f" ]]         && q=$(append_query_param "$q" "sort" "$sort_f")
+  [[ -n "$order_f" ]]        && q=$(append_query_param "$q" "order" "$order_f")
+  [[ -n "$fields_f" ]]       && q=$(append_query_param "$q" "fields" "$fields_f")
 
   http_request "GET" "/api/tasks?${q}"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
@@ -2335,6 +2404,11 @@ cmd_skills() {
     cli_version: $v,
     data: {
       workflows: {
+        query_tasks_efficiently: [
+          "ark tasks list --status blocked --since 2026-08-01 --until 2026-08-10 --brief",
+          "ark tasks list --status blocked --sort created_at --order asc --fields id,status,title,created_at",
+          "# Pass meta.next_cursor back verbatim when requesting the next page"
+        ],
         find_task: [
           "ark tasks find \"<factura|siniestro|paciente_documento|caso_id>\"",
           "ark tasks list --factura-key \"FE 57100\"",
@@ -2693,7 +2767,9 @@ TASKS
     [--status=hold|draft|queued|in_progress|blocked|review|done|archived|cancelled]
     [--priority=low|medium|high|critical]
     [--factura-key=]  [--client-ref=]  [--batch-id=]  [--parent-task-id=]
-    [--limit=20]  [--cursor=<iso-ts>]  [--all]
+    [--limit=20]  [--cursor=<opaque>]  [--all]
+    [--since=<iso-date>]  [--until=<iso-date>]  [--sort=<field>]  [--order=asc|desc]
+    [--fields=id,status,title,created_at | --brief]
   ark tasks find <text>              Find tasks by business identifier or title
     [--limit=20]  [--cursor=<cursor>]
   ark tasks get <id>                 Fetch a single task with next_commands
