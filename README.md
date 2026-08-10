@@ -282,6 +282,9 @@ ark tasks context-set "$TASK_ID" \
 ```
 ark tasks list             [--status=] [--priority=] [--factura-key=] [--client-ref=]
                            [--batch-id=] [--parent-task-id=] [--limit=20] [--cursor=] [--all]
+                           [--since=<iso-date>] [--until=<iso-date>]
+                           [--sort=<field>] [--order=asc|desc]
+                           [--fields=<comma-separated-fields> | --brief]
 ark tasks stats            # one-request histogram of task counts by status
 ark tasks find <text>      [--limit=20] [--cursor=]
 ark tasks get <id>
@@ -360,13 +363,32 @@ alias, but is intentionally omitted from help and examples.
 Run `ark --help` for the full reference including flags, environment variables,
 and exit codes.
 
+### Efficient task listings
+
+List only tasks created in a time window, process the oldest matching tasks
+first, and avoid transferring large descriptions or contexts when they are not
+needed:
+
+```bash
+ark tasks list --status blocked \
+  --since 2026-08-01 --until 2026-08-10 \
+  --sort created_at --order asc \
+  --fields id,status,title,created_at
+```
+
+`--since` and `--until` map to the API creation-time bounds `created_after` and
+`created_before`. Date-only values and full ISO 8601 timestamps are forwarded
+unchanged. `--brief` is shorthand for
+`--fields id,status,title,created_at`; it cannot be combined with `--fields`.
+When paginating, pass `meta.next_cursor` back to `--cursor` verbatim.
+
 ## Limits
 
 | Constraint | Value | Notes |
 |---|---|---|
 | Upload size | 500 MB | Client-side check before hitting the API; override with `ARK_MAX_UPLOAD_BYTES` only when the API/bucket limit changes |
 | JSON payload via `--data` / `--context` | No hard limit | Piped through stdin internally; not subject to OS `ARG_MAX` |
-| Task list page size | 100 tasks | Use `--limit` and `--cursor` for manual pagination, or `--all` to fetch every page |
+| Task list page size | 100 tasks | Use `--limit` and `--cursor` for manual pagination, `--all` to fetch every page, and `--brief` or `--fields` to minimize each page |
 
 `meta.count` reports only the number of tasks in the current list page. For an
 operational overview, use `ark tasks stats`; do not paginate large states just

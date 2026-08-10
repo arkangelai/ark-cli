@@ -11,6 +11,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `ark tasks stats` — fetches the complete task-status histogram from
   `GET /api/tasks/stats` in one request, avoiding exhaustive pagination for
   operational counts.
+- `ark tasks list` now supports creation-time windows (`--since`, `--until`),
+  server-side ordering (`--sort`, `--order`), and field projection (`--fields`
+  or the `--brief` shorthand) to avoid full-history scans and oversized pages.
 - `ark tasks find <text>` — searches task titles and business context fields
   through `GET /api/tasks/search`, returning task ID, status, and title with
   pagination metadata.
