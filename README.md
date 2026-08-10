@@ -130,6 +130,19 @@ ark tasks outputs submit "$TASK_ID" \
   --size 2500000
 ```
 
+To read a task's current primary result, stream the latest `report` version
+directly to another command or save it to disk:
+
+```bash
+ark tasks outputs download "$TASK_ID" | jq .
+ark tasks outputs download "$TASK_ID" --label artifact --version 2 -o artifact.pdf
+ark tasks inputs download "$TASK_ID" "$INPUT_ID" -o input.pdf
+```
+
+`outputs download` selects the highest version for `--label report` by default.
+When `-o` / `--output` is omitted, both download commands write only the stored
+file bytes to stdout, making pipelines safe and temporary files unnecessary.
+
 ### Bulk directory ingestion
 
 Use `ingest-dir` when each subdirectory is one case/task and all files inside
@@ -311,8 +324,10 @@ ark tasks release-batch --batch-id= [--limit=]
 ark tasks events <id>
 ark tasks inputs list <id>
 ark tasks inputs add <id>  --path= [--type=filesystem|storage|url] [--description=]
+ark tasks inputs upload <id> <file-path> [--description=] [--local-path=] [--path-type=]
 ark tasks inputs remove <id> <input-id>
 ark tasks inputs ocr <id> <input-id>
+ark tasks inputs download <id> <input-id> [-o <file> | --output=<file>]
 ark batches status <batch-id> [--missing-limit=]
 ark reps prestadores       [--codigo-habilitacion=] [--nit=] [--razon-social=] [--nombre=]
                            [--departamento=] [--municipio=] [--habilitado=SI|NO]
@@ -327,7 +342,9 @@ ark tasks comments post <id>     --label=note|blocker|comment|approved|changes_r
 ark tasks comments edit <id> <comment-id>   --body=
 ark tasks comments delete <id> <comment-id>
 ark tasks outputs list <id>
+ark tasks outputs download <id> [--label=report] [--version=N] [-o <file> | --output=<file>]
 ark tasks outputs submit <id>  --type=json|text|file|screenshot --label= [--data=] [--storage-path=] [--size=]
+ark tasks outputs upload <id> <file-path> --type= --label= [--local-path=]
 ark tasks outputs get <id> <output-id>
 ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]
 ark knowledge files url <path> <name>   [--task-type=audit] [--output=<local-path>]

@@ -197,11 +197,13 @@ Use these to read and mutate task state:
 | `ark tasks context-set <id> --set key=value` | **Merge fields into context** (preserves existing fields) |
 | `ark tasks outputs upload <id>` | Push output file and record it |
 | `ark tasks outputs submit <id>` | Register already-staged or inline output |
+| `ark tasks outputs download <id> [--label report] [--version N] [-o file]` | Download the latest matching output; defaults to the latest report and stdout |
 | `ark tasks complete <id> --confidence` | Transition to done or review |
 | `ark tasks block <id> --reason` | Signal blocker, transition to blocked |
 | `ark tasks comments post <id>` | Post a note or blocker comment |
 | `ark tasks inputs list <id>` | List task inputs |
 | `ark tasks inputs ocr <id> <input-id>` | Fetch OCR data for an input |
+| `ark tasks inputs download <id> <input-id> [-o file]` | Download a stored input to stdout or a file |
 | `ark batches status <batch-id>` | Read bulk-ingest status and missing inputs |
 | `ark reps prestadores\|servicios\|habilitacion` | Query the REPS provider and service registry |
 | `ark tasks create` | Create a follow-on task |

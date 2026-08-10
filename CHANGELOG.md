@@ -14,6 +14,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `ark tasks list` now supports creation-time windows (`--since`, `--until`),
   server-side ordering (`--sort`, `--order`), and field projection (`--fields`
   or the `--brief` shorthand) to avoid full-history scans and oversized pages.
+- `ark tasks outputs download <id> [--label report] [--version N] [-o file]`
+  selects the highest matching output version by default and downloads its
+  stored content directly to stdout or disk.
+- `ark tasks inputs download <id> <input-id> [-o file]` downloads a stored task
+  input without requiring callers to resolve a signed URL or invoke `curl`.
 - `ark tasks find <text>` — searches task titles and business context fields
   through `GET /api/tasks/search`, returning task ID, status, and title with
   pagination metadata.
