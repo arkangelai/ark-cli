@@ -360,6 +360,10 @@ dry_run_response() {
     'input as $body | {ok:true,cli_version:$v,dry_run:true,data:{would_send:{method:$m,path:$p,body:$body}}}'
 }
 
+uri_encode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
 # ─── auth ──────────────────────────────────────────────────────────────────────
 cmd_auth() {
   local sub="${1:-}"; shift || true
@@ -457,10 +461,10 @@ cmd_tasks_list() {
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  local q="?limit=${limit}"
-  [[ -n "$status_f" ]]   && q+="&status=${status_f}"
-  [[ -n "$priority_f" ]] && q+="&priority=${priority_f}"
-  [[ -n "$cursor" ]]     && q+="&cursor=${cursor}"
+  local q="?limit=$(uri_encode "$limit")"
+  [[ -n "$status_f" ]]   && q+="&status=$(uri_encode "$status_f")"
+  [[ -n "$priority_f" ]] && q+="&priority=$(uri_encode "$priority_f")"
+  [[ -n "$cursor" ]]     && q+="&cursor=$(uri_encode "$cursor")"
 
   http_request "GET" "/api/tasks${q}"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"

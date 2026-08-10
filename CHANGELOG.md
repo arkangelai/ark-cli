@@ -25,6 +25,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   registration now sends `files[]` with stable `client_ref` values and parses
   both `created` and `deduped` task rows on retry/resume.
 
+### Fixed
+- URL-encoded every `ark tasks list` query value so opaque pagination cursors
+  containing `+` reach the API verbatim instead of being decoded as spaces.
+
 ---
 
 ## [0.5.0] — 2026-06-18
