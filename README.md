@@ -98,7 +98,7 @@ ark tasks inputs list "$TASK_ID"   # paths the human declared for this task
 **3. Do the work — post notes, register new sources**
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:1"
-ark tasks comments post "$TASK_ID" --type note --body "Analysis in progress."
+ark tasks comments post "$TASK_ID" --label note --body "Analysis in progress."
 
 # If a new data source is discovered during execution:
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:input:1"
@@ -268,7 +268,7 @@ ark tasks inputs list <id>
 ark tasks inputs add <id>  --path= [--type=filesystem|storage|url] [--description=]
 ark tasks inputs remove <id> <input-id>
 ark tasks comments list <id>
-ark tasks comments post <id>     --type=note|blocker|comment|approved|changes_requested --body=
+ark tasks comments post <id>     --label=note|blocker|comment|approved|changes_requested --body=
 ark tasks comments edit <id> <comment-id>   --body=
 ark tasks comments delete <id> <comment-id>
 ark tasks outputs list <id>
@@ -293,6 +293,21 @@ ark version
 ```
 
 Global flags: `--human` (readable output), `--dry-run` (no side effects).
+
+### JSON field names
+
+Use the response field names below when filtering CLI JSON. In particular,
+comments use `label`, matching the canonical `comments post --label` flag.
+
+| Resource | Category/type field | Related field |
+|---|---|---|
+| comments | `label` | `author_type` |
+| outputs | `output_type` | `label` |
+| events | `actor_type` | — |
+| tasks | `task_type` | `created_by_type` |
+
+The former `comments post --type` spelling remains accepted as a compatibility
+alias, but is intentionally omitted from help and examples.
 
 Run `ark --help` for the full reference including flags, environment variables,
 and exit codes.

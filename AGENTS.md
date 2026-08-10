@@ -141,6 +141,27 @@ A re-queued task starts a new execution run — generate a fresh `TASK_RUN_ID`.
 
 ---
 
+## Resource Field Names
+
+Use these exact response fields when filtering JSON:
+
+| Resource | Category/type field | Related field |
+|---|---|---|
+| comments | `label` | `author_type` |
+| outputs | `output_type` | `label` |
+| events | `actor_type` | — |
+| tasks | `task_type` | `created_by_type` |
+
+Post comments with `--label`; the legacy `--type` spelling is accepted only as
+a compatibility alias. For example:
+
+```bash
+ark tasks comments post "$TASK_ID" --label blocker --body "Missing OCR"
+ark tasks comments list "$TASK_ID" | jq '.data[] | select(.label == "blocker")'
+```
+
+---
+
 ## Confidence Routing
 
 `ark tasks complete` routes automatically:
@@ -224,12 +245,12 @@ DESCRIPTION=$(echo "$TASK" | jq -r '.data.description')
 
 # Post a progress note
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note"
-ark tasks comments post "$TASK_ID" --type note --body "Completed analysis. Writing report."
+ark tasks comments post "$TASK_ID" --label note --body "Completed analysis. Writing report."
 
 # Determine confidence and post rationale as a comment
 CONFIDENCE=0.92
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Verified findings against source data; no unresolved edge cases."
 
 # Write the final output in the format the task context requires
@@ -310,7 +331,7 @@ LOG_PATH=$(echo "$TASK" | jq -r '.data.log_path')
 # Re-determine confidence and post rationale as a comment
 CONFIDENCE=0.90
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Addressed human feedback; <what changed and why>."
 
 # Write the revised output in the format the task context requires
@@ -407,7 +428,7 @@ if ark audit send-denial-mail "$TASK_ID" 2>"$STDERR_FILE"; then
   # Registrar fallos parciales como nota — no bloquear el flujo
   if [[ ${#PATCH_ERRORS[@]} -gt 0 ]]; then
     export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:patch-errors"
-    ark tasks comments post "$TASK_ID" --type note \
+    ark tasks comments post "$TASK_ID" --label note \
       --body "PATCH reply_sent falló para las siguientes tareas eps_audit: ${PATCH_ERRORS[*]}"
   fi
 
@@ -420,7 +441,7 @@ else
 
   # Postear stderr como nota antes de bloquear
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note"
-  ark tasks comments post "$TASK_ID" --type note --body "$STDERR_CONTENT"
+  ark tasks comments post "$TASK_ID" --label note --body "$STDERR_CONTENT"
 
   # Bloquear con razón estructurada
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:block"

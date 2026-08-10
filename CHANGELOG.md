@@ -18,6 +18,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
 
 ### Changed
+- `ark tasks comments post` now uses `--label` as its documented flag, matching
+  the `label` field returned by the API. The former `--type` spelling remains a
+  hidden compatibility alias. CLI help, `ark skills`, and agent guidance now
+  document the exact category/type fields for comments, outputs, events, and tasks.
 - Raised the default client-side upload ceiling from 50 MB to 500 MB for task
   inputs, outputs, knowledge uploads, and bulk ingestion. The limit can still be
   overridden with `ARK_MAX_UPLOAD_BYTES` if the backend limit changes.
