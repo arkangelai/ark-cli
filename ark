@@ -53,6 +53,19 @@ config_set() {
   mv "$tmp" "$ARK_CONFIG_FILE" && chmod 600 "$ARK_CONFIG_FILE"
 }
 
+config_display_value() {
+  local key="$1" value="$2"
+  if [[ "$key" == "api-key" && -n "$value" ]]; then
+    if [[ ${#value} -le 4 ]]; then
+      printf '%s' '***'
+    else
+      printf '%s***' "${value:0:4}"
+    fi
+  else
+    printf '%s' "$value"
+  fi
+}
+
 config_del() {
   if [[ -f "$ARK_CONFIG_FILE" ]]; then
     local tmp; tmp=$(mktemp)
@@ -413,7 +426,8 @@ cmd_config() {
         exit 2
       }
       config_set "$key" "$value"
-      jq -n --arg v "$ARK_VERSION" --arg k "$key" --arg val "$value" \
+      local display_value; display_value=$(config_display_value "$key" "$value")
+      jq -n --arg v "$ARK_VERSION" --arg k "$key" --arg val "$display_value" \
         '{ok:true,cli_version:$v,data:{key:$k,value:$val}}'
       ;;
     get)
@@ -429,8 +443,7 @@ cmd_config() {
     list)
       local url; url=$(config_get "url")
       local raw_key; raw_key=$(config_get "api-key")
-      local masked_key=""
-      [[ -n "$raw_key" ]] && masked_key="${raw_key:0:4}***"
+      local masked_key; masked_key=$(config_display_value "api-key" "$raw_key")
       jq -n --arg v "$ARK_VERSION" \
         --arg url "${url:-}" \
         --arg key "${masked_key}" \
