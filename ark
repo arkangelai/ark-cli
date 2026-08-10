@@ -2278,8 +2278,8 @@ cmd_audit() {
     exit 2
   }
 
-  local ark_dir; ark_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local scripts_dir="${ARK_SCRIPTS_DIR:-${ark_dir}/scripts}"
+  local share_dir="${ARK_SHARE_DIR:-${ARK_INSTALL_SHARE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli}}"
+  local scripts_dir="${ARK_SCRIPTS_DIR:-${share_dir}/scripts}"
   local script_path="${scripts_dir}/${operacion}.ts"
 
   if [[ ! -f "$script_path" ]]; then
@@ -2496,7 +2496,9 @@ cmd_skills() {
         ARK_DEBUG:           "0 | 1 | 2 (default: 0)",
         ARK_IDEMPOTENCY_KEY: "Reuse to retry a failed action with same key",
         ARK_CONFIG_FILE:     "Override the config file path (useful for isolated automation/tests)",
-        NO_COLOR:                "Disable ANSI colors"
+        ARK_SHARE_DIR:       "Override shared data directory",
+        ARK_SCRIPTS_DIR:     "Override audit scripts directory (default: <share-dir>/scripts)",
+        NO_COLOR:            "Disable ANSI colors"
       },
       idempotency_strategy: {
         pattern:  "Generate TASK_RUN_ID=$(ark gen-uuid) once per execution run",
@@ -2674,7 +2676,7 @@ cmd_update() {
   if [[ -x "$updater" ]]; then
     exec "$updater" "$@"
   fi
-  exec bash -c 'curl -fsSL "https://raw.githubusercontent.com/${ARK_UPDATE_REPO:-arkangelai/tasks-ark-cli}/main/skill.sh" | bash -s -- "$@"' _ "$@"
+  exec bash -c 'curl -fsSL "https://raw.githubusercontent.com/${ARK_UPDATE_REPO:-arkangelai/ark-cli}/main/skill.sh" | bash -s -- "$@"' _ "$@"
 }
 
 # ─── usage ─────────────────────────────────────────────────────────────────────
@@ -2834,7 +2836,8 @@ ENVIRONMENT
   ARK_DEBUG            0 | 1 | 2  (2 = print full request + response)
   ARK_IDEMPOTENCY_KEY  Reuse this key on retry to get idempotent response
   ARK_CONFIG_FILE      Override the config file path
-  ARK_SCRIPTS_DIR      Override scripts directory (default: <ark-dir>/scripts)
+  ARK_SHARE_DIR        Override shared data directory
+  ARK_SCRIPTS_DIR      Override scripts directory (default: <share-dir>/scripts)
 
 EXIT CODES
   0   Success

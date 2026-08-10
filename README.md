@@ -14,14 +14,23 @@ Tasks Ark is a bash CLI for AI agents to read, claim, execute, and report on tas
 # Option 1: run the installer
 bash install.sh
 
+# Optional explicit destinations
+bash install.sh --prefix /usr/local/bin --share-dir /usr/local/share/tasks-ark-cli
+
 # Option 2: manual
 cp ark /usr/local/bin/ark
 chmod +x /usr/local/bin/ark
 ```
 
+The installer places executables in the binary prefix and keeps `skills/`,
+`scripts/`, and its update copy under the shared data directory. When run with
+`sudo`, its default shared data directory is resolved from `SUDO_USER` instead
+of root's home. `ARK_SHARE_DIR` and `ARK_SCRIPTS_DIR` can override runtime and
+update lookup paths for custom layouts.
+
 ## Update
 
-Once installed, keep `ark`, `skill.sh`, and the `skills/` folder current with:
+Once installed, keep `ark`, `skill.sh`, `skills/`, and `scripts/` current with:
 
 ```bash
 ark update

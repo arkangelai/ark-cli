@@ -9,13 +9,14 @@
 #
 # Env vars:
 #   ARK_UPDATE_SUDO=1          retry mv/cp via sudo when the prefix is not writable
-#   ARK_UPDATE_REPO=owner/name override (default: arkangelai/tasks-ark-cli)
+#   ARK_UPDATE_REPO=owner/name override (default: arkangelai/ark-cli)
+#   ARK_SHARE_DIR=/path       override shared data directory
 set -euo pipefail
 
 REPO="${ARK_UPDATE_REPO:-arkangelai/ark-cli}"
 REF="main"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
-SHARE_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli"
+SHARE_DIR="${ARK_SHARE_DIR:-${ARK_INSTALL_SHARE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli}}"
 
 err() {
   local code="$1" msg="$2" cur="${3:-unknown}"
@@ -30,6 +31,17 @@ resolve_path() {
 }
 
 parse_version() { grep -m1 '^ARK_VERSION=' "$1" | cut -d'"' -f2; }
+
+embed_share_dir() {
+  local file="$1" first_line tmp="${1}.share-dir.$$"
+  {
+    IFS= read -r first_line
+    printf '%s\n' "$first_line"
+    printf 'ARK_INSTALL_SHARE_DIR=%q\n' "$SHARE_DIR"
+    cat
+  } < "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
 
 # Walk up looking for a git worktree whose origin URL contains $REPO.
 find_checkout() {
@@ -126,6 +138,8 @@ do_mv() {
 do_cp "$TARGET_ARK" "$BACKUP" || {
   err "write_denied" "cannot backup ${TARGET_ARK}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
 
+embed_share_dir "${STAGE}/ark"
+embed_share_dir "${STAGE}/skill.sh"
 chmod +x "${STAGE}/ark" "${STAGE}/install.sh" "${STAGE}/skill.sh"
 
 do_mv "${STAGE}/ark" "$TARGET_ARK" || {
@@ -142,14 +156,14 @@ if [ -d "${STAGE}/skills" ]; then
 fi
 
 if [ -d "${STAGE}/scripts" ]; then
-  SCRIPTS_DEST="${PREFIX_DIR}/scripts"
+  SCRIPTS_DEST="${SHARE_DIR}/scripts"
   rm -rf "$SCRIPTS_DEST" 2>/dev/null || true
   mv "${STAGE}/scripts" "$SCRIPTS_DEST" 2>/dev/null || {
     if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then
       sudo rm -rf "$SCRIPTS_DEST"
       sudo mv "${STAGE}/scripts" "$SCRIPTS_DEST" && SUDO_USED="sudo"
     else
-      err "write_denied" "cannot place scripts/ in ${PREFIX_DIR}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6
+      err "write_denied" "cannot place scripts/ in ${SCRIPTS_DEST}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6
     fi
   }
 fi
@@ -159,11 +173,12 @@ jq -n \
   --arg mode "$MODE" --arg checkout "$CHECKOUT" --arg ark "$TARGET_ARK" \
   --arg bak "$BACKUP" --arg skill "${PREFIX_DIR}/skill.sh" \
   --arg skills_dir "${SHARE_DIR}/skills" --arg install_sh "${SHARE_DIR}/install.sh" \
+  --arg scripts_dir "${SHARE_DIR}/scripts" \
   --arg sudo_used "$SUDO_USED" \
   '{ok:true,cli_version:$cli,data:{
       mode:$mode, checkout:$checkout,
       previous_version:$cur, new_version:$new,
       ark_path:$ark, skill_path:$skill,
-      skills_dir:$skills_dir, install_sh_path:$install_sh,
+      skills_dir:$skills_dir, scripts_dir:$scripts_dir, install_sh_path:$install_sh,
       backup:$bak, sudo_used:$sudo_used
     }}'
