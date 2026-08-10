@@ -138,6 +138,16 @@ Si exit code ≠ `0` en el script: capturar stderr, postearlo como comentario `n
 
 This is the standard workflow. Follow every step in order.
 
+If the request identifies an existing task by factura, siniestro, patient
+document, or client case instead of UUID, resolve it first with:
+
+```bash
+ark tasks find "<business identifier>"
+```
+
+For exact first-class identifiers, use `ark tasks list --factura-key`,
+`--client-ref`, `--batch-id`, or `--parent-task-id`.
+
 ### Step 1: Generate a run ID
 
 Generate a unique ID for this execution run. Every idempotency key you use will
@@ -905,6 +915,8 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 
 ```
 ark tasks list --status queued --limit 1      Find available work
+ark tasks find "<business identifier>"        Find an existing task
+ark tasks list --factura-key "FE 57100"       Filter by exact business column
 ark tasks claim <id>                          Claim it (queued → in_progress)
 ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read

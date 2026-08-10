@@ -8,6 +8,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks find <text>` — searches task titles and business context fields
+  through `GET /api/tasks/search`, returning task ID, status, and title with
+  pagination metadata.
+- Exact `ark tasks list` filters for `--factura-key`, `--client-ref`,
+  `--batch-id`, and `--parent-task-id`.
 - `ark tasks ingest-dir <dir>` — bulk directory ingestion where each
   subdirectory is a case/task. Supports `--map subdir-as-case`, `--task-type`,
   `--status`, `--priority`, `--batch-id`, bounded upload concurrency,

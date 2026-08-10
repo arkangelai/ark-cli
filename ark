@@ -360,6 +360,10 @@ dry_run_response() {
     'input as $body | {ok:true,cli_version:$v,dry_run:true,data:{would_send:{method:$m,path:$p,body:$body}}}'
 }
 
+uri_encode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
 # ─── auth ──────────────────────────────────────────────────────────────────────
 cmd_auth() {
   local sub="${1:-}"; shift || true
@@ -443,24 +447,37 @@ cmd_config() {
 # ─── tasks list ────────────────────────────────────────────────────────────────
 cmd_tasks_list() {
   local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor=""
+  local factura_key="" client_ref="" batch_id="" parent_task_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --status=*)   status_f="${1#--status=}" ;;
-      --status)     shift; status_f="$1" ;;
-      --priority=*) priority_f="${1#--priority=}" ;;
-      --priority)   shift; priority_f="$1" ;;
-      --limit=*)    limit="${1#--limit=}" ;;
-      --limit)      shift; limit="$1" ;;
-      --cursor=*)   cursor="${1#--cursor=}" ;;
-      --cursor)     shift; cursor="$1" ;;
-      --all)        limit=100 ;;
+      --status=*)         status_f="${1#--status=}" ;;
+      --status)           shift; status_f="$1" ;;
+      --priority=*)       priority_f="${1#--priority=}" ;;
+      --priority)         shift; priority_f="$1" ;;
+      --factura-key=*)    factura_key="${1#--factura-key=}" ;;
+      --factura-key)      shift; factura_key="$1" ;;
+      --client-ref=*)     client_ref="${1#--client-ref=}" ;;
+      --client-ref)       shift; client_ref="$1" ;;
+      --batch-id=*)       batch_id="${1#--batch-id=}" ;;
+      --batch-id)         shift; batch_id="$1" ;;
+      --parent-task-id=*) parent_task_id="${1#--parent-task-id=}" ;;
+      --parent-task-id)   shift; parent_task_id="$1" ;;
+      --limit=*)          limit="${1#--limit=}" ;;
+      --limit)            shift; limit="$1" ;;
+      --cursor=*)         cursor="${1#--cursor=}" ;;
+      --cursor)           shift; cursor="$1" ;;
+      --all)              limit=100 ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  local q="?limit=${limit}"
-  [[ -n "$status_f" ]]   && q+="&status=${status_f}"
-  [[ -n "$priority_f" ]] && q+="&priority=${priority_f}"
-  [[ -n "$cursor" ]]     && q+="&cursor=${cursor}"
+  local q="?limit=$(uri_encode "$limit")"
+  [[ -n "$status_f" ]]       && q+="&status=$(uri_encode "$status_f")"
+  [[ -n "$priority_f" ]]     && q+="&priority=$(uri_encode "$priority_f")"
+  [[ -n "$factura_key" ]]    && q+="&factura_key=$(uri_encode "$factura_key")"
+  [[ -n "$client_ref" ]]     && q+="&client_ref=$(uri_encode "$client_ref")"
+  [[ -n "$batch_id" ]]       && q+="&batch_id=$(uri_encode "$batch_id")"
+  [[ -n "$parent_task_id" ]] && q+="&parent_task_id=$(uri_encode "$parent_task_id")"
+  [[ -n "$cursor" ]]         && q+="&cursor=$(uri_encode "$cursor")"
 
   http_request "GET" "/api/tasks${q}"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
@@ -471,6 +488,43 @@ cmd_tasks_list() {
 
   if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
     printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.status)] \(.id) — \(.title)"'
+    echo "count: $(printf '%s' "$meta" | jq -r '.count // 0')"
+    return
+  fi
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks find ────────────────────────────────────────────────────────────────
+cmd_tasks_find() {
+  local query="${1:-}"; shift || true
+  [[ -n "$query" ]] || {
+    err_json "bad_argument" "Search text required" "false" "{}" "ark tasks find <text> [--limit=<N>] [--cursor=<cursor>]"
+    exit 2
+  }
+
+  local limit="$ARK_DEFAULT_LIMIT" cursor=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit=*)  limit="${1#--limit=}" ;;
+      --limit)    shift; limit="$1" ;;
+      --cursor=*) cursor="${1#--cursor=}" ;;
+      --cursor)   shift; cursor="$1" ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks find <text> [--limit=<N>] [--cursor=<cursor>]"; exit 2 ;;
+    esac; shift || true
+  done
+
+  local q="?q=$(uri_encode "$query")&limit=$(uri_encode "$limit")"
+  [[ -n "$cursor" ]] && q+="&cursor=$(uri_encode "$cursor")"
+
+  http_request "GET" "/api/tasks/search${q}"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '[.data[]? | {id, status, title}]')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r '.[] | "[\(.status)] \(.id) — \(.title)"'
     echo "count: $(printf '%s' "$meta" | jq -r '.count // 0')"
     return
   fi
@@ -2036,6 +2090,12 @@ cmd_skills() {
     cli_version: $v,
     data: {
       workflows: {
+        find_task: [
+          "ark tasks find \"<factura|siniestro|paciente_documento|caso_id>\"",
+          "ark tasks list --factura-key \"FE 57100\"",
+          "ark tasks list --client-ref \"<client-ref>\"",
+          "ark tasks get \"<id>\""
+        ],
         execute_queued_task: [
           "TASK_RUN_ID=$(ark gen-uuid)",
           "TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r \".data[0].id\")",
@@ -2351,7 +2411,11 @@ SETUP
 TASKS
   ark tasks list                     List tasks
     [--status=hold|draft|queued|in_progress|blocked|review|done|archived|cancelled]
-    [--priority=low|medium|high|critical]  [--limit=20]  [--cursor=<iso-ts>]  [--all]
+    [--priority=low|medium|high|critical]
+    [--factura-key=]  [--client-ref=]  [--batch-id=]  [--parent-task-id=]
+    [--limit=20]  [--cursor=<iso-ts>]  [--all]
+  ark tasks find <text>              Find tasks by business identifier or title
+    [--limit=20]  [--cursor=<cursor>]
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
@@ -2505,6 +2569,7 @@ main() {
       local sub="${1:-}"; shift || true
       case "$sub" in
         list)     cmd_tasks_list "$@" ;;
+        find)     cmd_tasks_find "$@" ;;
         get)      cmd_tasks_get "$@" ;;
         create)   cmd_tasks_create "$@" ;;
         update)   cmd_tasks_update "$@" ;;

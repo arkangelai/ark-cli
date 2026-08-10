@@ -202,6 +202,31 @@ ark tasks claim "$TASK_ID"
 Prior workspace and inputs are preserved across re-runs. Output versions
 auto-increment.
 
+### Find a task by business identifier
+
+Use exact filters when the identifier is stored in a first-class task column:
+
+```bash
+ark tasks list --factura-key "FE 57100"
+ark tasks list --client-ref "customer-case-42"
+ark tasks list --batch-id "audit-2026-08"
+ark tasks list --parent-task-id "$PARENT_TASK_ID"
+```
+
+Use `find` when the value may be in the title or business context, including
+`caso_id`, `nro_factura`, `siniestro`, or `paciente_documento`:
+
+```bash
+ark tasks find "FE 57100"
+ark tasks find "14-2026-1836300" --limit 10
+ark tasks find "1061625335" --cursor "<meta.next_cursor>"
+```
+
+`find` returns `id`, `status`, and `title` for each match. Both commands retain
+the standard list `meta` object for bounded pagination. These options require
+an API deployment that exposes the corresponding task filters and search
+endpoint.
+
 ### Human operations — updating task context
 
 A human can update or clear a task's `context` field at any point (before or
@@ -247,7 +272,9 @@ ark tasks context-set "$TASK_ID" \
 ## Command Reference
 
 ```
-ark tasks list             [--status=] [--priority=] [--limit=20] [--cursor=] [--all]
+ark tasks list             [--status=] [--priority=] [--factura-key=] [--client-ref=]
+                           [--batch-id=] [--parent-task-id=] [--limit=20] [--cursor=] [--all]
+ark tasks find <text>      [--limit=20] [--cursor=]
 ark tasks get <id>
 ark tasks create           --title= [--description=] [--priority=] [--deadline=] [--context=] [--status=hold|draft|queued]
 ark tasks update <id>      --log-path=
