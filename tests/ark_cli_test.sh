@@ -106,8 +106,8 @@ test_list_all_follows_cursor() {
       HTTP_REQUEST_ID="request-list-${request_number}"
       HTTP_IDEMPOTENT_REPLAY="false"
       if [[ "$2" == "/api/tasks?limit=100&status=review" ]]; then
-        HTTP_BODY='{"ok":true,"data":[{"id":"one"},{"id":"two"}],"meta":{"count":2,"next_cursor":"cursor-2"}}'
-      elif [[ "$2" == "/api/tasks?limit=100&status=review&cursor=cursor-2" ]]; then
+        HTTP_BODY='{"ok":true,"data":[{"id":"one"},{"id":"two"}],"meta":{"count":2,"next_cursor":"cursor+2:next"}}'
+      elif [[ "$2" == "/api/tasks?limit=100&status=review&cursor=cursor%2B2%3Anext" ]]; then
         HTTP_BODY='{"ok":true,"data":[{"id":"three"}],"meta":{"count":1,"next_cursor":null}}'
       else
         return 1
