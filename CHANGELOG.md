@@ -8,11 +8,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks stats` — fetches the complete task-status histogram from
+  `GET /api/tasks/stats` in one request, avoiding exhaustive pagination for
+  operational counts.
+- `ark tasks list` now supports creation-time windows (`--since`, `--until`),
+  server-side ordering (`--sort`, `--order`), and field projection (`--fields`
+  or the `--brief` shorthand) to avoid full-history scans and oversized pages.
+- `ark tasks outputs download <id> [--label report] [--version N] [-o file]`
+  selects the highest matching output version by default and downloads its
+  stored content directly to stdout or disk.
+- `ark tasks inputs download <id> <input-id> [-o file]` downloads a stored task
+  input without requiring callers to resolve a signed URL or invoke `curl`.
 - `ark tasks find <text>` — searches task titles and business context fields
   through `GET /api/tasks/search`, returning task ID, status, and title with
   pagination metadata.
-- Exact `ark tasks list` filters for `--factura-key`, `--client-ref`,
-  `--batch-id`, and `--parent-task-id`.
+- Exact `ark tasks list` filters for `--type` / `--task-type`,
+  `--created-by-type`, `--factura-key`, `--client-ref`, `--batch-id`, and
+  `--parent` / `--parent-task-id`.
 - `ark tasks claim-next [--task-type]` — atomically claims the next
   profile-eligible task, removing the `list` + `claim` race between workers.
 - `ark tasks ask-review <id> [--reason]` — requests human review without
@@ -31,6 +43,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
 
 ### Changed
+- `ark tasks list --all` now follows `meta.next_cursor` until all matching tasks
+  are returned instead of silently truncating the result to one page of 100.
 - `ark tasks comments post` now uses `--label` as its documented flag, matching
   the `label` field returned by the API. The former `--type` spelling remains a
   hidden compatibility alias. CLI help, `ark skills`, and agent guidance now

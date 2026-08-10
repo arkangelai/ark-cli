@@ -8,6 +8,7 @@ ARK_DEFAULT_LIMIT="20"
 HUMAN_OUTPUT="${HUMAN_OUTPUT:-false}"
 DRY_RUN=false
 KNOWN_TASK_FIELDS="id title description status priority task_type context deadline_at log_path confidence_score version created_by created_by_type created_at updated_at"
+BRIEF_TASK_FIELDS="id,status,title,created_at"
 
 # ─── Dependencies ──────────────────────────────────────────────────────────────
 check_deps() {
@@ -388,6 +389,84 @@ append_query_param() {
   fi
 }
 
+# Resolve a task document's signed URL and stream it to stdout or atomically
+# replace the requested output file. The metadata argument is included only in
+# file-mode responses; stdout must remain raw so callers can pipe it directly.
+download_task_document() {
+  local task_id="$1" kind="$2" record_id="$3" output_path="$4" metadata="$5"
+  local encoded_task_id encoded_record_id
+  encoded_task_id=$(url_encode "$task_id")
+  encoded_record_id=$(url_encode "$record_id")
+
+  http_request "GET" "/api/tasks/${encoded_task_id}/documents/${kind}/${encoded_record_id}/url"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local signed_url expires_at storage_path
+  signed_url=$(printf '%s' "$HTTP_BODY" | jq -r '.data.url // empty')
+  expires_at=$(printf '%s' "$HTTP_BODY" | jq -r '.data.expires_at // empty')
+  storage_path=$(printf '%s' "$HTTP_BODY" | jq -r '.data.storage_path // .data.path // empty')
+
+  [[ -n "$signed_url" ]] || {
+    err_json "storage_error" "No signed URL returned for ${kind} ${record_id}" "false" \
+      "$(jq -n --arg task_id "$task_id" --arg kind "$kind" --arg record_id "$record_id" \
+        '{task_id:$task_id,kind:$kind,record_id:$record_id}')" ""
+    exit 1
+  }
+
+  local curl_exit=0
+  if [[ -z "$output_path" ]]; then
+    set +e
+    curl --fail --silent --location "$signed_url"
+    curl_exit=$?
+    set -e
+  else
+    local output_dir temp_path
+    [[ ! -d "$output_path" ]] || {
+      err_json "bad_argument" "Output path is a directory: ${output_path}" "false" "{}" ""
+      exit 2
+    }
+    output_dir=$(dirname "$output_path")
+    [[ -d "$output_dir" ]] || {
+      err_json "bad_argument" "Output directory does not exist: ${output_dir}" "false" "{}" ""
+      exit 2
+    }
+    temp_path=$(mktemp "${output_path}.tmp.XXXXXX") || {
+      err_json "write_error" "Could not create a temporary file for: ${output_path}" "false" "{}" ""
+      exit 1
+    }
+    set +e
+    curl --fail --silent --location --output "$temp_path" "$signed_url"
+    curl_exit=$?
+    set -e
+    if [[ $curl_exit -eq 0 ]]; then
+      if ! mv "$temp_path" "$output_path" 2>/dev/null; then
+        rm -f "$temp_path"
+        err_json "write_error" "Could not replace output file: ${output_path}" "false" "{}" ""
+        exit 1
+      fi
+    else
+      rm -f "$temp_path"
+    fi
+  fi
+
+  if [[ $curl_exit -ne 0 ]]; then
+    err_json "network_error" "Download failed (curl exit ${curl_exit})" "true" \
+      "$(jq -n --arg task_id "$task_id" --arg kind "$kind" --arg record_id "$record_id" \
+        '{task_id:$task_id,kind:$kind,record_id:$record_id}')" "Retry to request a fresh signed URL"
+    exit 1
+  fi
+
+  [[ -z "$output_path" ]] && return
+
+  local size_bytes local_path
+  size_bytes=$(file_size_bytes "$output_path" 2>/dev/null || echo 0)
+  local_path=$(abs_path "$output_path")
+  ok_response "$(printf '%s' "$metadata" | jq \
+    --arg url "$signed_url" --arg exp "$expires_at" --arg sp "$storage_path" \
+    --arg lp "$local_path" --argjson sz "${size_bytes:-0}" \
+    '. + {url:$url,expires_at:$exp,storage_path:$sp,local_path:$lp,size_bytes:$sz}')" "{}" "{}"
+}
+
 # ─── auth ──────────────────────────────────────────────────────────────────────
 cmd_auth() {
   local sub="${1:-}"; shift || true
@@ -469,54 +548,176 @@ cmd_config() {
 }
 
 # ─── tasks list ────────────────────────────────────────────────────────────────
+require_option_value() {
+  local option="$1" value="$2"
+  [[ -n "$value" ]] || {
+    err_json "bad_argument" "${option} requires a value" "false" "{}" ""
+    exit 2
+  }
+}
+
+validate_task_fields() {
+  local fields="$1" field
+  local selected_fields=()
+
+  [[ -n "$fields" ]] || {
+    err_json "bad_argument" "--fields requires a comma-separated field list" "false" "{}" \
+      "Example: ark tasks list --fields id,status,title,created_at"
+    exit 2
+  }
+
+  IFS=',' read -r -a selected_fields <<< "$fields"
+  for field in "${selected_fields[@]}"; do
+    if [[ -z "$field" || ! "$field" =~ ^[a-z][a-z0-9_]*$ ]]; then
+      err_json "bad_argument" "Invalid task field: ${field:-<empty>}" "false" \
+        "$(jq -cn --arg field "$field" '{received:$field,format:"lowercase snake_case"}')" \
+        "Use a comma-separated list such as id,status,title,created_at"
+      exit 2
+    fi
+  done
+  if [[ "$fields" == *, ]]; then
+    err_json "bad_argument" "Invalid task field: <empty>" "false" \
+      "$(jq -cn '{received:"",format:"lowercase snake_case"}')" \
+      "Remove the trailing comma from --fields"
+    exit 2
+  fi
+}
+
 cmd_tasks_list() {
-  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor=""
-  local factura_key="" client_ref="" batch_id="" parent_task_id=""
+  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor="" fetch_all="false"
+  local created_after="" created_before="" sort_f="" order_f="" fields_f=""
+  local task_type="" created_by_type="" factura_key="" client_ref=""
+  local batch_id="" parent_task_id="" option_name=""
+  local brief="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --status=*)         status_f="${1#--status=}" ;;
-      --status)           shift; status_f="$1" ;;
-      --priority=*)       priority_f="${1#--priority=}" ;;
-      --priority)         shift; priority_f="$1" ;;
-      --factura-key=*)    factura_key="${1#--factura-key=}" ;;
-      --factura-key)      shift; factura_key="$1" ;;
-      --client-ref=*)     client_ref="${1#--client-ref=}" ;;
-      --client-ref)       shift; client_ref="$1" ;;
-      --batch-id=*)       batch_id="${1#--batch-id=}" ;;
-      --batch-id)         shift; batch_id="$1" ;;
-      --parent-task-id=*) parent_task_id="${1#--parent-task-id=}" ;;
-      --parent-task-id)   shift; parent_task_id="$1" ;;
-      --limit=*)          limit="${1#--limit=}" ;;
-      --limit)            shift; limit="$1" ;;
-      --cursor=*)         cursor="${1#--cursor=}" ;;
-      --cursor)           shift; cursor="$1" ;;
-      --all)              limit=100 ;;
+      --status=*)   status_f="${1#--status=}" ;;
+      --status)     [[ $# -ge 2 ]] || { err_json "bad_argument" "--status requires a value" "false" "{}" ""; exit 2; }; shift; status_f="$1" ;;
+      --priority=*) priority_f="${1#--priority=}" ;;
+      --priority)   [[ $# -ge 2 ]] || { err_json "bad_argument" "--priority requires a value" "false" "{}" ""; exit 2; }; shift; priority_f="$1" ;;
+      --type=*|--task-type=*) task_type="${1#*=}"; require_option_value "${1%%=*}" "$task_type" ;;
+      --type|--task-type) option_name="$1"; [[ $# -ge 2 ]] || require_option_value "$option_name" ""; shift; task_type="$1"; require_option_value "$option_name" "$task_type" ;;
+      --created-by-type=*) created_by_type="${1#--created-by-type=}"; require_option_value "--created-by-type" "$created_by_type" ;;
+      --created-by-type) [[ $# -ge 2 ]] || require_option_value "--created-by-type" ""; shift; created_by_type="$1"; require_option_value "--created-by-type" "$created_by_type" ;;
+      --factura-key=*) factura_key="${1#--factura-key=}"; require_option_value "--factura-key" "$factura_key" ;;
+      --factura-key) [[ $# -ge 2 ]] || require_option_value "--factura-key" ""; shift; factura_key="$1"; require_option_value "--factura-key" "$factura_key" ;;
+      --client-ref=*) client_ref="${1#--client-ref=}"; require_option_value "--client-ref" "$client_ref" ;;
+      --client-ref) [[ $# -ge 2 ]] || require_option_value "--client-ref" ""; shift; client_ref="$1"; require_option_value "--client-ref" "$client_ref" ;;
+      --batch-id=*) batch_id="${1#--batch-id=}"; require_option_value "--batch-id" "$batch_id" ;;
+      --batch-id) [[ $# -ge 2 ]] || require_option_value "--batch-id" ""; shift; batch_id="$1"; require_option_value "--batch-id" "$batch_id" ;;
+      --parent=*|--parent-task-id=*) parent_task_id="${1#*=}"; require_option_value "${1%%=*}" "$parent_task_id" ;;
+      --parent|--parent-task-id) option_name="$1"; [[ $# -ge 2 ]] || require_option_value "$option_name" ""; shift; parent_task_id="$1"; require_option_value "$option_name" "$parent_task_id" ;;
+      --limit=*)    limit="${1#--limit=}" ;;
+      --limit)      [[ $# -ge 2 ]] || { err_json "bad_argument" "--limit requires a value" "false" "{}" ""; exit 2; }; shift; limit="$1" ;;
+      --cursor=*)   cursor="${1#--cursor=}" ;;
+      --cursor)     [[ $# -ge 2 ]] || { err_json "bad_argument" "--cursor requires a value" "false" "{}" ""; exit 2; }; shift; cursor="$1" ;;
+      --since=*)    created_after="${1#--since=}"; require_option_value "--since" "$created_after" ;;
+      --since)      [[ $# -ge 2 ]] || require_option_value "--since" ""; shift; created_after="$1"; require_option_value "--since" "$created_after" ;;
+      --until=*)    created_before="${1#--until=}"; require_option_value "--until" "$created_before" ;;
+      --until)      [[ $# -ge 2 ]] || require_option_value "--until" ""; shift; created_before="$1"; require_option_value "--until" "$created_before" ;;
+      --sort=*)     sort_f="${1#--sort=}"; require_option_value "--sort" "$sort_f" ;;
+      --sort)       [[ $# -ge 2 ]] || require_option_value "--sort" ""; shift; sort_f="$1"; require_option_value "--sort" "$sort_f" ;;
+      --order=*)    order_f="${1#--order=}"; require_option_value "--order" "$order_f" ;;
+      --order)      [[ $# -ge 2 ]] || require_option_value "--order" ""; shift; order_f="$1"; require_option_value "--order" "$order_f" ;;
+      --fields=*)   fields_f="${1#--fields=}"; require_option_value "--fields" "$fields_f" ;;
+      --fields)     [[ $# -ge 2 ]] || require_option_value "--fields" ""; shift; fields_f="$1"; require_option_value "--fields" "$fields_f" ;;
+      --brief)      brief="true" ;;
+      --all)        fetch_all="true"; limit=100 ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  local q=""
-  q=$(append_query_param "$q" "limit" "$limit")
-  [[ -n "$status_f" ]]       && q=$(append_query_param "$q" "status" "$status_f")
-  [[ -n "$priority_f" ]]     && q=$(append_query_param "$q" "priority" "$priority_f")
-  [[ -n "$factura_key" ]]    && q=$(append_query_param "$q" "factura_key" "$factura_key")
-  [[ -n "$client_ref" ]]     && q=$(append_query_param "$q" "client_ref" "$client_ref")
-  [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
-  [[ -n "$parent_task_id" ]] && q=$(append_query_param "$q" "parent_task_id" "$parent_task_id")
-  [[ -n "$cursor" ]]         && q=$(append_query_param "$q" "cursor" "$cursor")
 
-  http_request "GET" "/api/tasks?${q}"
-  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+  if [[ -n "$order_f" && "$order_f" != "asc" && "$order_f" != "desc" ]]; then
+    err_json "bad_argument" "--order must be asc or desc" "false" \
+      "$(jq -cn --arg order "$order_f" '{received:$order,allowed:["asc","desc"]}')" \
+      "Use --order asc or --order desc"
+    exit 2
+  fi
+  if [[ "$brief" == "true" && -n "$fields_f" ]]; then
+    err_json "bad_argument" "--brief and --fields cannot be used together" "false" "{}" \
+      "Use --brief or provide an explicit --fields list"
+    exit 2
+  fi
+  [[ "$brief" == "true" ]] && fields_f="$BRIEF_TASK_FIELDS"
+  [[ -n "$fields_f" ]] && validate_task_fields "$fields_f"
 
-  local data meta
-  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
-  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+  local data="[]" meta="{}" page_cursor="$cursor" total_count=0
+  while true; do
+    local q=""
+    q=$(append_query_param "$q" "limit" "$limit")
+    [[ -n "$status_f" ]]       && q=$(append_query_param "$q" "status" "$status_f")
+    [[ -n "$priority_f" ]]     && q=$(append_query_param "$q" "priority" "$priority_f")
+    [[ -n "$task_type" ]]      && q=$(append_query_param "$q" "task_type" "$task_type")
+    [[ -n "$created_by_type" ]] && q=$(append_query_param "$q" "created_by_type" "$created_by_type")
+    [[ -n "$factura_key" ]]    && q=$(append_query_param "$q" "factura_key" "$factura_key")
+    [[ -n "$client_ref" ]]     && q=$(append_query_param "$q" "client_ref" "$client_ref")
+    [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
+    [[ -n "$parent_task_id" ]] && q=$(append_query_param "$q" "parent_task_id" "$parent_task_id")
+    [[ -n "$page_cursor" ]]    && q=$(append_query_param "$q" "cursor" "$page_cursor")
+    [[ -n "$created_after" ]]  && q=$(append_query_param "$q" "created_after" "$created_after")
+    [[ -n "$created_before" ]] && q=$(append_query_param "$q" "created_before" "$created_before")
+    [[ -n "$sort_f" ]]         && q=$(append_query_param "$q" "sort" "$sort_f")
+    [[ -n "$order_f" ]]        && q=$(append_query_param "$q" "order" "$order_f")
+    [[ -n "$fields_f" ]]       && q=$(append_query_param "$q" "fields" "$fields_f")
+
+    http_request "GET" "/api/tasks?${q}"
+    [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+    local page_data page_meta
+    page_data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+    page_meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+    if [[ "$fetch_all" != "true" ]]; then
+      data="$page_data"
+      meta="$page_meta"
+      break
+    fi
+
+    data=$(printf '%s\n%s\n' "$data" "$page_data" | jq -cs '.[0] + .[1]')
+    total_count=$(printf '%s' "$data" | jq 'length')
+
+    local next_cursor
+    next_cursor=$(printf '%s' "$page_meta" | jq -r '.next_cursor // empty')
+    if [[ -z "$next_cursor" ]]; then
+      meta=$(printf '%s' "$page_meta" | jq -c --argjson count "$total_count" \
+        '. + {count:$count,next_cursor:null}')
+      break
+    fi
+    if [[ "$next_cursor" == "$page_cursor" ]]; then
+      err_json "pagination_stalled" "API returned the same next_cursor twice" "false" \
+        "$(jq -n --arg cursor "$next_cursor" '{cursor:$cursor}')" \
+        "Retry without --all and inspect meta.next_cursor"
+      exit 1
+    fi
+    page_cursor="$next_cursor"
+  done
 
   if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
-    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.status)] \(.id) — \(.title)"'
+    printf '%s' "$data" | jq -r '.[] | "[\(.status)] \(.id) — \(.title)"'
     echo "count: $(printf '%s' "$meta" | jq -r '.count // 0')"
     return
   fi
   ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks stats ───────────────────────────────────────────────────────────────
+cmd_tasks_stats() {
+  if [[ $# -gt 0 ]]; then
+    err_json "bad_argument" "tasks stats does not accept arguments" "false" "{}" "ark tasks stats"
+    exit 2
+  fi
+
+  http_request "GET" "/api/tasks/stats"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r 'to_entries[] | "\(.key): \(.value)"'
+    return
+  fi
+  ok_response "$data" "{}" "{}"
 }
 
 # ─── tasks find ────────────────────────────────────────────────────────────────
@@ -1546,6 +1747,35 @@ cmd_tasks_inputs_ocr() {
   ok_response "$data" "{}" "{}"
 }
 
+# ─── tasks inputs download ─────────────────────────────────────────────────────
+cmd_tasks_inputs_download() {
+  local id="${1:-}" input_id="${2:-}"; shift 2 || true
+  [[ -n "$id" && -n "$input_id" ]] || {
+    err_json "bad_argument" "Task ID and input ID required" "false" "{}" \
+      "ark tasks inputs download <id> <input-id> [-o <file>]"
+    exit 2
+  }
+
+  local output_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output) local output_flag="$1"; shift; [[ $# -gt 0 && -n "$1" ]] || { err_json "bad_argument" "${output_flag} requires a file path" "false" "{}" ""; exit 2; }; output_path="$1" ;;
+      --output=*) output_path="${1#--output=}"; [[ -n "$output_path" ]] || { err_json "bad_argument" "--output requires a file path" "false" "{}" ""; exit 2; } ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_run_response "GET" "/api/tasks/${id}/documents/input/${input_id}/url -> signed file${output_path:+ -> ${output_path}}"
+    return
+  fi
+
+  local metadata
+  metadata=$(jq -n --arg task_id "$id" --arg input_id "$input_id" \
+    '{task_id:$task_id,kind:"input",input_id:$input_id}')
+  download_task_document "$id" "input" "$input_id" "$output_path" "$metadata"
+}
+
 # ─── tasks comments list ───────────────────────────────────────────────────────
 cmd_tasks_comments_list() {
   local id="${1:-}"
@@ -1757,6 +1987,74 @@ cmd_tasks_outputs_get() {
 
   local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
   ok_response "$data" "{}" "{}"
+}
+
+# ─── tasks outputs download ────────────────────────────────────────────────────
+cmd_tasks_outputs_download() {
+  local id="${1:-}"; shift || true
+  [[ -n "$id" ]] || {
+    err_json "bad_argument" "Task ID required" "false" "{}" \
+      "ark tasks outputs download <id> [--label report] [--version N] [-o <file>]"
+    exit 2
+  }
+
+  local label="report" version="" output_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --label=*) label="${1#--label=}" ;;
+      --label) shift; [[ $# -gt 0 ]] || { err_json "bad_argument" "--label requires a value" "false" "{}" ""; exit 2; }; label="$1" ;;
+      --version=*) version="${1#--version=}"; [[ -n "$version" ]] || { err_json "bad_argument" "--version requires a value" "false" "{}" ""; exit 2; } ;;
+      --version) shift; [[ $# -gt 0 && -n "$1" ]] || { err_json "bad_argument" "--version requires a value" "false" "{}" ""; exit 2; }; version="$1" ;;
+      -o|--output) local output_flag="$1"; shift; [[ $# -gt 0 && -n "$1" ]] || { err_json "bad_argument" "${output_flag} requires a file path" "false" "{}" ""; exit 2; }; output_path="$1" ;;
+      --output=*) output_path="${1#--output=}"; [[ -n "$output_path" ]] || { err_json "bad_argument" "--output requires a file path" "false" "{}" ""; exit 2; } ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
+    esac; shift || true
+  done
+
+  [[ -n "$label" ]] || { err_json "bad_argument" "--label cannot be empty" "false" "{}" ""; exit 2; }
+  if [[ -n "$version" && ( ! "$version" =~ ^[0-9]+$ || "$version" -lt 1 ) ]]; then
+    err_json "bad_argument" "--version must be a positive integer" "false" "{}" ""; exit 2
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_run_response "GET" "/api/tasks/${id}/outputs -> select label=${label}${version:+ version=${version}} -> signed file${output_path:+ -> ${output_path}}"
+    return
+  fi
+
+  local encoded_id; encoded_id=$(url_encode "$id")
+  http_request "GET" "/api/tasks/${encoded_id}/outputs"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local selected
+  if [[ -n "$version" ]]; then
+    selected=$(printf '%s' "$HTTP_BODY" | jq -c --arg label "$label" --arg version "$version" \
+      '[.data[]? | select(.label == $label and (.version | tostring) == $version)] | last // empty')
+  else
+    selected=$(printf '%s' "$HTTP_BODY" | jq -c --arg label "$label" \
+      '[.data[]? | select(.label == $label)] | sort_by(.version | tonumber) | last // empty')
+  fi
+
+  [[ -n "$selected" ]] || {
+    local detail
+    detail=$(jq -n --arg task_id "$id" --arg label "$label" --arg version "$version" \
+      '{task_id:$task_id,label:$label} + (if $version != "" then {version:($version | tonumber)} else {} end)')
+    err_json "not_found" "No output found for label '${label}'${version:+ and version ${version}}" "false" "$detail" \
+      "ark tasks outputs list ${id}"
+    exit 4
+  }
+
+  local output_id
+  output_id=$(printf '%s' "$selected" | jq -r '.id // empty')
+  [[ -n "$output_id" ]] || {
+    err_json "invalid_response" "Selected output is missing its ID" "false" \
+      "$(jq -n --arg task_id "$id" --arg label "$label" '{task_id:$task_id,label:$label}')" ""
+    exit 1
+  }
+
+  local metadata
+  metadata=$(printf '%s' "$selected" | jq -c --arg task_id "$id" \
+    '{task_id:$task_id,kind:"output",output_id:.id,label:.label,version:.version,output_type:.output_type}')
+  download_task_document "$id" "output" "$output_id" "$output_path" "$metadata"
 }
 
 # ─── tasks documents url ───────────────────────────────────────────────────────
@@ -2344,10 +2642,23 @@ cmd_skills() {
     cli_version: $v,
     data: {
       workflows: {
+        operational_overview: [
+          "ark tasks stats",
+          "# Use stats for counts. Do not paginate task lists merely to count statuses."
+        ],
+        query_tasks_efficiently: [
+          "ark tasks list --status blocked --since 2026-08-01 --until 2026-08-10 --brief",
+          "ark tasks list --status blocked --sort created_at --order asc --fields id,status,title,created_at",
+          "# Pass meta.next_cursor back verbatim when requesting the next page"
+        ],
         find_task: [
           "ark tasks find \"<factura|siniestro|paciente_documento|caso_id>\"",
+          "ark tasks list --task-type \"<task-type>\"",
+          "ark tasks list --created-by-type \"<creator-type>\"",
           "ark tasks list --factura-key \"FE 57100\"",
           "ark tasks list --client-ref \"<client-ref>\"",
+          "ark tasks list --batch-id \"<batch-id>\"",
+          "ark tasks list --parent \"<parent-task-id>\"",
           "ark tasks get \"<id>\""
         ],
         execute_queued_task: [
@@ -2428,6 +2739,16 @@ cmd_skills() {
         fetch_document_url: [
           "# Get a short-lived signed URL (~1h) to download a stored input or output",
           "ark tasks documents url \"$TASK_ID\" output \"$OUTPUT_ID\" | jq -r '.data.url'"
+        ],
+        download_latest_output: [
+          "# Stream the latest report output directly to stdout",
+          "ark tasks outputs download \"$TASK_ID\" | jq .",
+          "# Or save an explicitly selected output to disk",
+          "ark tasks outputs download \"$TASK_ID\" --label artifact --version 2 -o ./artifact.bin"
+        ],
+        download_input: [
+          "# Stream a stored input directly to stdout, or pass -o to save it",
+          "ark tasks inputs download \"$TASK_ID\" \"$INPUT_ID\" -o ./input.bin"
         ],
         batch_denial_mail: [
           "# Paso 1 — tomar atómicamente una tarea del tipo esperado",
@@ -2561,7 +2882,7 @@ cmd_skills() {
         next_commands:    "ready-to-run Tasks Ark CLI commands keyed by action name",
         idempotent_replay:"boolean — true when response came from idempotency cache",
         request_id:       "uuid for log correlation with API",
-        meta:             "(list responses only) count and next_cursor"
+        meta:             "(list responses only) count for this page and next_cursor; use ark tasks stats for totals"
       },
       task_types: {
         "general":             "Razona y ejecuta con instrucciones en context. Usar workflow execute_queued_task.",
@@ -2704,8 +3025,13 @@ TASKS
   ark tasks list                     List tasks
     [--status=hold|draft|queued|in_progress|blocked|review|done|archived|cancelled]
     [--priority=low|medium|high|critical]
-    [--factura-key=]  [--client-ref=]  [--batch-id=]  [--parent-task-id=]
-    [--limit=20]  [--cursor=<iso-ts>]  [--all]
+    [--type=|--task-type=]  [--created-by-type=]
+    [--factura-key=]  [--client-ref=]  [--batch-id=]  [--parent=|--parent-task-id=]
+    [--limit=20]  [--cursor=<opaque>]  [--all]
+    [--since=<iso-date>]  [--until=<iso-date>]  [--sort=<field>]  [--order=asc|desc]
+    [--fields=id,status,title,created_at | --brief]
+    --all follows pagination until every matching task has been fetched
+  ark tasks stats                    Count tasks by status in one request
   ark tasks find <text>              Find tasks by business identifier or title
     [--limit=20]  [--cursor=<cursor>]
   ark tasks get <id>                 Fetch a single task with next_commands
@@ -2750,6 +3076,8 @@ INPUTS
     [--description=]  [--local-path=]  [--path-type=filesystem|storage|url]
   ark tasks inputs remove <id> <input-id>   Remove a human-registered input
   ark tasks inputs ocr <id> <input-id>      Fetch OCR data for a task input
+  ark tasks inputs download <id> <input-id> Download a stored input
+    [-o <file> | --output=<file>]     Stream raw bytes to stdout when omitted
 
 BATCHES
   ark batches status <batch-id>      Read bulk-ingest progress
@@ -2777,6 +3105,9 @@ COMMENTS
 
 OUTPUTS
   ark tasks outputs list <id>        List outputs (ordered by version desc)
+  ark tasks outputs download <id>    Download the latest matching output
+    [--label=report]  [--version=<N>]  [-o <file> | --output=<file>]
+    Defaults to the highest report version; streams raw bytes to stdout without -o
   ark tasks outputs submit <id>      Submit an inline or pre-staged deliverable (agent only)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
     [--data=<json>]  [--storage-path=]  [--size=<bytes>]
@@ -2884,6 +3215,7 @@ main() {
       local sub="${1:-}"; shift || true
       case "$sub" in
         list)     cmd_tasks_list "$@" ;;
+        stats)    cmd_tasks_stats "$@" ;;
         find)     cmd_tasks_find "$@" ;;
         get)      cmd_tasks_get "$@" ;;
         create)   cmd_tasks_create "$@" ;;
@@ -2906,6 +3238,7 @@ main() {
             list)   cmd_tasks_inputs_list "$@" ;;
             add)    cmd_tasks_inputs_add "$@" ;;
             upload) cmd_tasks_inputs_upload "$@" ;;
+            download) cmd_tasks_inputs_download "$@" ;;
             remove) cmd_tasks_inputs_remove "$@" ;;
             ocr)    cmd_tasks_inputs_ocr "$@" ;;
             *) err_json "bad_argument" "Unknown inputs subcommand: ${sub2}" "false" "{}" ""; exit 2 ;;
@@ -2925,6 +3258,7 @@ main() {
             list)   cmd_tasks_outputs_list "$@" ;;
             submit) cmd_tasks_outputs_submit "$@" ;;
             upload) cmd_tasks_outputs_upload "$@" ;;
+            download) cmd_tasks_outputs_download "$@" ;;
             get)    cmd_tasks_outputs_get "$@" ;;
             *) err_json "bad_argument" "Unknown outputs subcommand: ${sub2}" "false" "{}" ""; exit 2 ;;
           esac ;;

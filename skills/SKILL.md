@@ -139,8 +139,9 @@ document, or client case instead of UUID, resolve it first with:
 ark tasks find "<business identifier>"
 ```
 
-For exact first-class identifiers, use `ark tasks list --factura-key`,
-`--client-ref`, `--batch-id`, or `--parent-task-id`.
+For exact first-class fields, use `ark tasks list --task-type`,
+`--created-by-type`, `--factura-key`, `--client-ref`, `--batch-id`, or
+`--parent` (`--parent-task-id` is also accepted).
 
 ### Step 1: Generate a run ID
 
@@ -164,6 +165,11 @@ TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 
 This is one atomic operation. Never use `tasks list --limit 1` followed by
 `tasks claim`; two workers can select the same task before either claim lands.
+
+For an operational overview or counts by status, run `ark tasks stats`. It
+returns the complete status histogram in one request. A list response's
+`.meta.count` is only the number of tasks in that page, so never paginate large
+task states merely to count them.
 
 Read from the response:
 - `.data.id` → store as `TASK_ID`. Required for all subsequent commands.
@@ -519,23 +525,29 @@ to, public URLs). Use `inputs upload` for files that must travel with the task.
 ## Workflow 6 — Fetch a Stored Document
 
 Use this to download an input or output file that was uploaded earlier. The API
-hands back a short-lived (~1 hour) Supabase Storage signed URL; use it
-immediately and do not cache it.
+hands the CLI a short-lived (~1 hour) Supabase Storage signed URL internally.
+The high-level download commands resolve and consume it immediately.
 
 ```bash
-# Signed URL for an output
-URL=$(ark tasks documents url "$TASK_ID" output "$OUTPUT_ID" | jq -r '.data.url')
-curl -o ./artifact.pdf "$URL"
+# Latest report (highest version) as raw stdout, suitable for a pipeline
+ark tasks outputs download "$TASK_ID" | jq .
 
-# Signed URL for an input
-URL=$(ark tasks documents url "$TASK_ID" input "$INPUT_ID" | jq -r '.data.url')
-curl -o ./seed.csv "$URL"
+# An explicit label/version saved to disk
+ark tasks outputs download "$TASK_ID" --label artifact --version 2 -o ./artifact.pdf
+
+# A stored input, also saved to disk
+ark tasks inputs download "$TASK_ID" "$INPUT_ID" -o ./seed.csv
 ```
 
-In `--human` mode the URL is printed directly so you can pipe into `xargs`:
+Without `-o` / `--output`, both commands emit only the stored file bytes. With
+an output path, they return the standard success envelope with `local_path`,
+`size_bytes`, `storage_path`, and signed-URL metadata.
+
+Use the lower-level URL command only when another application needs the URL
+itself:
 
 ```bash
-ark --human tasks documents url "$TASK_ID" output "$OUTPUT_ID" | xargs curl -o out.pdf
+ark tasks documents url "$TASK_ID" output "$OUTPUT_ID" | jq -r '.data.url'
 ```
 
 Read from the response:
@@ -924,9 +936,15 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 ## Quick Reference
 
 ```
+ark tasks stats                               Count all tasks by status in one request
 ark tasks list --status queued --limit 1      Find available work
+ark tasks list --status blocked --since <iso> --sort created_at --order asc --brief
+                                              Scan oldest blockers with a small payload
 ark tasks find "<business identifier>"        Find an existing task
 ark tasks list --factura-key "FE 57100"       Filter by exact business column
+ark tasks list --task-type audit_soat          Filter by task workflow kind
+ark tasks list --created-by-type agent         Filter by creator kind
+ark tasks list --parent "$PARENT_TASK_ID"      Filter child tasks by parent
 ark tasks claim-next                          Atomically claim available work
 ark tasks claim <id>                          Re-claim a known re-queued task
 ark tasks ask-review <id> [--reason=]         Request review without completing
@@ -934,6 +952,7 @@ ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read
 ark tasks inputs add <id> --path <p> --type   Register a reference-only source
 ark tasks inputs upload <id> <file>           Upload a file as an input (≤ 500 MB)
+ark tasks inputs download <id> <input-id>     Stream a stored input or save it with -o
 ark tasks ingest-dir <dir> --map subdir-as-case --task-type <type> --batch-id <id>
                                               Bulk-create case tasks and upload inputs (hold requires human key + audit_soat)
 ark tasks release-batch --batch-id <id> --limit <N>
@@ -946,6 +965,7 @@ ark tasks outputs upload <id> <file> --type <t> --label artifact
 ark tasks outputs upload <id> <file> --type <t> --label progress
                                               Upload an intermediate work product
 ark tasks outputs submit <id> --type --label  Deliver inline data or register a pre-staged storage path
+ark tasks outputs download <id> [--label]     Stream the latest report (or selected label/version); save with -o
 ark tasks documents url <id> <kind> <rec-id>  Short-lived signed URL (~1h)
 ark tasks complete <id> --confidence <score>  Close the task
 ark tasks block <id> --reason <reason>        Signal a blocker

@@ -60,17 +60,48 @@ export ARK_TEST_RESPONSE
 run_ark tasks list \
   --status 'needs review' \
   --priority 'high+urgent' \
+  --task-type 'audit soat' \
+  --created-by-type 'human+agent' \
   --factura-key 'FE 57100' \
   --client-ref 'case+42' \
   --batch-id 'batch/2026' \
-  --parent-task-id 'parent?one' \
+  --parent 'parent?one' \
   --limit 3 \
   --cursor '2026-08-10T12:00:00+00:00' >/dev/null
 
 actual_url=$(<"$capture_url")
-expected_url='https://api.example.test/api/tasks?limit=3&status=needs%20review&priority=high%2Burgent&factura_key=FE%2057100&client_ref=case%2B42&batch_id=batch%2F2026&parent_task_id=parent%3Fone&cursor=2026-08-10T12%3A00%3A00%2B00%3A00'
+expected_url='https://api.example.test/api/tasks?limit=3&status=needs%20review&priority=high%2Burgent&task_type=audit%20soat&created_by_type=human%2Bagent&factura_key=FE%2057100&client_ref=case%2B42&batch_id=batch%2F2026&parent_task_id=parent%3Fone&cursor=2026-08-10T12%3A00%3A00%2B00%3A00'
 [[ "$actual_url" == "$expected_url" ]] || {
   printf 'List URL mismatch\nExpected: %s\nActual:   %s\n' "$expected_url" "$actual_url" >&2
+  exit 1
+}
+
+run_ark tasks list \
+  --type 'batch denial' \
+  --created-by-type='human/operator' \
+  --parent-task-id 'parent two' \
+  --limit=1 >/dev/null
+
+actual_url=$(<"$capture_url")
+expected_url='https://api.example.test/api/tasks?limit=1&task_type=batch%20denial&created_by_type=human%2Foperator&parent_task_id=parent%20two'
+[[ "$actual_url" == "$expected_url" ]] || {
+  printf 'List alias URL mismatch\nExpected: %s\nActual:   %s\n' "$expected_url" "$actual_url" >&2
+  exit 1
+}
+
+run_ark tasks list --type=general --parent=parent-three >/dev/null
+actual_url=$(<"$capture_url")
+expected_url='https://api.example.test/api/tasks?limit=20&task_type=general&parent_task_id=parent-three'
+[[ "$actual_url" == "$expected_url" ]] || {
+  printf 'List equals alias URL mismatch\nExpected: %s\nActual:   %s\n' "$expected_url" "$actual_url" >&2
+  exit 1
+}
+
+run_ark tasks list --task-type=audit_soat >/dev/null
+actual_url=$(<"$capture_url")
+expected_url='https://api.example.test/api/tasks?limit=20&task_type=audit_soat'
+[[ "$actual_url" == "$expected_url" ]] || {
+  printf 'List task-type equals URL mismatch\nExpected: %s\nActual:   %s\n' "$expected_url" "$actual_url" >&2
   exit 1
 }
 
