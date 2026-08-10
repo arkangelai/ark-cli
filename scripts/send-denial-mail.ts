@@ -49,7 +49,7 @@ function readArkConfig(): Record<string, string> {
 const arkConfig = readArkConfig();
 
 function getApiUrl(): string {
-  return process.env.ARK_API_URL ?? arkConfig["url"] ?? "http://localhost:3000";
+  return process.env.ARK_API_URL ?? arkConfig["url"] ?? "https://audit.arkangel.ai";
 }
 
 function getApiKey(): string {

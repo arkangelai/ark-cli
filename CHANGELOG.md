@@ -38,6 +38,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   both `created` and `deduped` task rows on retry/resume.
 
 ### Fixed
+- URL-encoded every `ark tasks list` query value so opaque pagination cursors
+  containing `+` reach the API verbatim instead of being decoded as spaces.
 - Masked `api-key` values in `ark config set` output so setup logs and agent
   transcripts no longer expose the configured secret.
 
@@ -220,7 +222,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - `ark tasks create --type <general|eps_audit>` — set task type at creation time
   (immutable after creation; defaults to `general` if omitted).
-- `ark check` — fetches the live API spec from `https://salmona-api.vercel.app/api/openapi.json`
+- `ark check` — fetches the live API spec from `https://audit.arkangel.ai/api/openapi.json`
   and compares its Task schema fields against the CLI's known field list.
   Exits `0` when up-to-date, `1` when the API has fields the CLI doesn't know about.
   Override the spec URL with `ARK_CHECK_URL=<url>`.

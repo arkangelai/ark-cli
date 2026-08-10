@@ -3,7 +3,7 @@ set -euo pipefail
 
 ARK_VERSION="0.5.0"
 ARK_CONFIG_FILE="${ARK_CONFIG_FILE:-${HOME}/.config/ark/config}"
-ARK_DEFAULT_API_URL="http://localhost:3000"
+ARK_DEFAULT_API_URL="https://audit.arkangel.ai"
 ARK_DEFAULT_LIMIT="20"
 HUMAN_OUTPUT="${HUMAN_OUTPUT:-false}"
 DRY_RUN=false
@@ -485,10 +485,10 @@ cmd_tasks_list() {
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  local q="?limit=${limit}"
-  [[ -n "$status_f" ]]   && q+="&status=${status_f}"
-  [[ -n "$priority_f" ]] && q+="&priority=${priority_f}"
-  [[ -n "$cursor" ]]     && q+="&cursor=${cursor}"
+  local q="?limit=$(url_encode "$limit")"
+  [[ -n "$status_f" ]]   && q+="&status=$(url_encode "$status_f")"
+  [[ -n "$priority_f" ]] && q+="&priority=$(url_encode "$priority_f")"
+  [[ -n "$cursor" ]]     && q+="&cursor=$(url_encode "$cursor")"
 
   http_request "GET" "/api/tasks${q}"
   [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
@@ -2432,7 +2432,7 @@ cmd_skills() {
         "29": "rate limited 429 — retry after delay"
       },
       env_vars: {
-        ARK_API_URL:         "API base URL (default: http://localhost:3000)",
+        ARK_API_URL:         "API base URL (default: https://audit.arkangel.ai)",
         ARK_FORMAT:          "json | human (default: json)",
         ARK_DEBUG:           "0 | 1 | 2 (default: 0)",
         ARK_IDEMPOTENCY_KEY: "Reuse to retry a failed action with same key",
@@ -2565,7 +2565,7 @@ cmd_schema() {
 
 # ─── check ─────────────────────────────────────────────────────────────────────
 cmd_check() {
-  local check_url="${ARK_CHECK_URL:-https://salmona-api.vercel.app/api/openapi.json}"
+  local check_url="${ARK_CHECK_URL:-${ARK_DEFAULT_API_URL}/api/openapi.json}"
 
   local spec
   spec=$(curl -fsSL "$check_url") || { err_json "network_error" "Failed to fetch spec from $check_url" "true" "{}" ""; exit 1; }
