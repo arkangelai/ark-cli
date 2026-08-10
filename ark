@@ -442,7 +442,7 @@ cmd_config() {
 
 # ─── tasks list ────────────────────────────────────────────────────────────────
 cmd_tasks_list() {
-  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor=""
+  local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor="" fetch_all="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status_f="${1#--status=}" ;;
@@ -453,28 +453,76 @@ cmd_tasks_list() {
       --limit)      shift; limit="$1" ;;
       --cursor=*)   cursor="${1#--cursor=}" ;;
       --cursor)     shift; cursor="$1" ;;
-      --all)        limit=100 ;;
+      --all)        fetch_all="true"; limit=100 ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  local q="?limit=${limit}"
-  [[ -n "$status_f" ]]   && q+="&status=${status_f}"
-  [[ -n "$priority_f" ]] && q+="&priority=${priority_f}"
-  [[ -n "$cursor" ]]     && q+="&cursor=${cursor}"
 
-  http_request "GET" "/api/tasks${q}"
-  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+  local data="[]" meta="{}" page_cursor="$cursor" total_count=0
+  while true; do
+    local q="?limit=${limit}"
+    [[ -n "$status_f" ]]   && q+="&status=${status_f}"
+    [[ -n "$priority_f" ]] && q+="&priority=${priority_f}"
+    [[ -n "$page_cursor" ]] && q+="&cursor=${page_cursor}"
 
-  local data meta
-  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
-  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+    http_request "GET" "/api/tasks${q}"
+    [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+    local page_data page_meta
+    page_data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // []')
+    page_meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta // {}')
+
+    if [[ "$fetch_all" != "true" ]]; then
+      data="$page_data"
+      meta="$page_meta"
+      break
+    fi
+
+    data=$(printf '%s\n%s\n' "$data" "$page_data" | jq -cs '.[0] + .[1]')
+    total_count=$(printf '%s' "$data" | jq 'length')
+
+    local next_cursor
+    next_cursor=$(printf '%s' "$page_meta" | jq -r '.next_cursor // empty')
+    if [[ -z "$next_cursor" ]]; then
+      meta=$(printf '%s' "$page_meta" | jq -c --argjson count "$total_count" \
+        '. + {count:$count,next_cursor:null}')
+      break
+    fi
+    if [[ "$next_cursor" == "$page_cursor" ]]; then
+      err_json "pagination_stalled" "API returned the same next_cursor twice" "false" \
+        "$(jq -n --arg cursor "$next_cursor" '{cursor:$cursor}')" \
+        "Retry without --all and inspect meta.next_cursor"
+      exit 1
+    fi
+    page_cursor="$next_cursor"
+  done
 
   if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
-    printf '%s' "$HTTP_BODY" | jq -r '.data[] | "[\(.status)] \(.id) — \(.title)"'
+    printf '%s' "$data" | jq -r '.[] | "[\(.status)] \(.id) — \(.title)"'
     echo "count: $(printf '%s' "$meta" | jq -r '.count // 0')"
     return
   fi
   ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── tasks stats ───────────────────────────────────────────────────────────────
+cmd_tasks_stats() {
+  if [[ $# -gt 0 ]]; then
+    err_json "bad_argument" "tasks stats does not accept arguments" "false" "{}" "ark tasks stats"
+    exit 2
+  fi
+
+  http_request "GET" "/api/tasks/stats"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+
+  local data
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+
+  if [[ "${ARK_FORMAT:-json}" == "human" || "$HUMAN_OUTPUT" == "true" ]]; then
+    printf '%s' "$data" | jq -r 'to_entries[] | "\(.key): \(.value)"'
+    return
+  fi
+  ok_response "$data" "{}" "{}"
 }
 
 # ─── tasks get ─────────────────────────────────────────────────────────────────
@@ -2036,6 +2084,10 @@ cmd_skills() {
     cli_version: $v,
     data: {
       workflows: {
+        operational_overview: [
+          "ark tasks stats",
+          "# Use stats for counts. Do not paginate task lists merely to count statuses."
+        ],
         execute_queued_task: [
           "TASK_RUN_ID=$(ark gen-uuid)",
           "TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r \".data[0].id\")",
@@ -2210,7 +2262,7 @@ cmd_skills() {
         next_commands:    "ready-to-run Tasks Ark CLI commands keyed by action name",
         idempotent_replay:"boolean — true when response came from idempotency cache",
         request_id:       "uuid for log correlation with API",
-        meta:             "(list responses only) count and next_cursor"
+        meta:             "(list responses only) count for this page and next_cursor; use ark tasks stats for totals"
       },
       task_types: {
         "general":             "Razona y ejecuta con instrucciones en context. Usar workflow execute_queued_task.",
@@ -2351,7 +2403,9 @@ SETUP
 TASKS
   ark tasks list                     List tasks
     [--status=hold|draft|queued|in_progress|blocked|review|done|archived|cancelled]
-    [--priority=low|medium|high|critical]  [--limit=20]  [--cursor=<iso-ts>]  [--all]
+    [--priority=low|medium|high|critical]  [--limit=20]  [--cursor=<opaque>]  [--all]
+    --all follows pagination until every matching task has been fetched
+  ark tasks stats                    Count tasks by status in one request
   ark tasks get <id>                 Fetch a single task with next_commands
   ark tasks create                   Create a task
     --title=<title>  [--description=]  [--priority=]  [--deadline=]
@@ -2505,6 +2559,7 @@ main() {
       local sub="${1:-}"; shift || true
       case "$sub" in
         list)     cmd_tasks_list "$@" ;;
+        stats)    cmd_tasks_stats "$@" ;;
         get)      cmd_tasks_get "$@" ;;
         create)   cmd_tasks_create "$@" ;;
         update)   cmd_tasks_update "$@" ;;

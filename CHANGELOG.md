@@ -8,6 +8,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks stats` — fetches the complete task-status histogram from
+  `GET /api/tasks/stats` in one request, avoiding exhaustive pagination for
+  operational counts.
 - `ark tasks ingest-dir <dir>` — bulk directory ingestion where each
   subdirectory is a case/task. Supports `--map subdir-as-case`, `--task-type`,
   `--status`, `--priority`, `--batch-id`, bounded upload concurrency,
@@ -18,6 +21,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
 
 ### Changed
+- `ark tasks list --all` now follows `meta.next_cursor` until all matching tasks
+  are returned instead of silently truncating the result to one page of 100.
 - Raised the default client-side upload ceiling from 50 MB to 500 MB for task
   inputs, outputs, knowledge uploads, and bulk ingestion. The limit can still be
   overridden with `ARK_MAX_UPLOAD_BYTES` if the backend limit changes.

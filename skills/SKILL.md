@@ -161,7 +161,12 @@ Read from the response:
 - `.data[0].title` → what the task is.
 - `.data[0].description` → full human explanation of the goal.
 - `.data[0].context` → structured JSON instructions. This is your primary input.
-- `.meta.count` → if `0`, no work is available. Exit gracefully.
+- `.meta.count` → number of tasks in this page. With `--limit 1`, `0` means no
+  work is available. It is not the total number of matching tasks.
+
+For an operational overview or counts by status, run `ark tasks stats`. It
+returns the complete status histogram in one request. Never paginate large task
+states merely to count them.
 
 If `.meta.count` is `0`:
 
@@ -904,6 +909,7 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 ## Quick Reference
 
 ```
+ark tasks stats                               Count all tasks by status in one request
 ark tasks list --status queued --limit 1      Find available work
 ark tasks claim <id>                          Claim it (queued → in_progress)
 ark tasks update <id> --log-path <path>       Declare workspace
