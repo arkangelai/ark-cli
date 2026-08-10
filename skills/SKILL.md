@@ -78,22 +78,16 @@ the message to the user. Exit code `6` means the install prefix is not writable.
 
 Este workflow se aplica cuando `.data[0].task_type` es `batch-denial-mail`. El agente no razona sobre el contenido — solo ejecuta el script y reporta el resultado.
 
-### Paso 1: Detectar la tarea
-
-```bash
-ark tasks list --status queued --limit 1
-```
-
-Leer `.data[0].task_type`. Si es `batch-denial-mail`, seguir este workflow. Si no, usar Workflow 1.
-
-### Paso 2: Tomar la tarea
+### Paso 1: Tomar y detectar la tarea
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+CLAIM=$(ark tasks claim-next --task-type batch-denial-mail)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 ```
 
-Verificar que `.data.status` sea `"in_progress"` antes de continuar.
+Leer `.data.task_type`. Si es `batch-denial-mail`, seguir este workflow. Si no,
+usar Workflow 1. Verificar que `.data.status` sea `"in_progress"` antes de continuar.
 
 ### Paso 3: Ejecutar el script
 
@@ -150,20 +144,25 @@ TASK_RUN_ID=$(ark gen-uuid)
 Never reuse a `TASK_RUN_ID` across different execution runs. If a task is
 re-queued after review or a blocker, generate a fresh one.
 
-### Step 2: Find a queued task
+### Step 2: Atomically claim the next queued task
 
 ```bash
-ark tasks list --status queued --limit 1
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 ```
 
-Read from the response:
-- `.data[0].id` → store as `TASK_ID`. Required for all subsequent commands.
-- `.data[0].title` → what the task is.
-- `.data[0].description` → full human explanation of the goal.
-- `.data[0].context` → structured JSON instructions. This is your primary input.
-- `.meta.count` → if `0`, no work is available. Exit gracefully.
+This is one atomic operation. Never use `tasks list --limit 1` followed by
+`tasks claim`; two workers can select the same task before either claim lands.
 
-If `.meta.count` is `0`:
+Read from the response:
+- `.data.id` → store as `TASK_ID`. Required for all subsequent commands.
+- `.data.title` → what the task is.
+- `.data.description` → full human explanation of the goal.
+- `.data.context` → structured JSON instructions. This is your primary input.
+- missing or empty `.data.id` → no eligible work is available. Exit gracefully.
+
+If `TASK_ID` is empty:
 
 ```json
 {"ok": false, "error": "No queued tasks available"}
@@ -171,14 +170,9 @@ If `.meta.count` is `0`:
 
 Exit with code `0`. Do not retry in a tight loop.
 
-### Step 3: Claim the task
+### Step 3: Validate the claim
 
-```bash
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
-```
-
-Read from the response:
+The claim response contains:
 - `.data.status` → must be `"in_progress"`. If not, something is wrong — stop and report.
 - `.idempotent_replay` → if `true`, this claim was already made in a prior attempt. Continue normally.
 - `.next_commands` → the map of valid next operations. Read it. Follow it.
@@ -233,7 +227,7 @@ per step — so a reviewer can scan what you are doing without opening anything:
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:1"
-ark tasks comments post "$TASK_ID" --type note --body "Finished data collection, starting analysis."
+ark tasks comments post "$TASK_ID" --label note --body "Finished data collection, starting analysis."
 ```
 
 Increment the suffix (`:note:1`, `:note:2`, ...) per note.
@@ -298,7 +292,7 @@ the score in a shell variable, then post the rationale as a note comment:
 ```bash
 CONFIDENCE=0.87
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Verified against 2 source documents; one edge case unresolved: Q4 breakdown missing for region EU-West."
 ```
 
@@ -458,7 +452,7 @@ cannot see the run boundary.)
 ```bash
 CONFIDENCE=0.90
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Addressed <specific feedback>; <what changed and why>."
 
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
@@ -698,6 +692,25 @@ Use `context-set` whenever you need to annotate the task record with facts produ
 
 ## Gotchas
 
+**Filter JSON using each resource's actual field names.**
+
+| Resource | Category/type field | Related field |
+|---|---|---|
+| comments | `label` | `author_type` |
+| outputs | `output_type` | `label` |
+| events | `actor_type` | — |
+| tasks | `task_type` | `created_by_type` |
+
+Post comments with `--label` and filter them with `.label`, for example:
+
+```bash
+ark tasks comments post "$TASK_ID" --label blocker --body "Missing OCR"
+ark tasks comments list "$TASK_ID" | jq '.data[] | select(.label == "blocker")'
+```
+
+The legacy `comments post --type` spelling remains accepted only for backward
+compatibility. Do not use it in new commands.
+
 **`review → queued` requires a `comment_id`.**
 When a human re-queues a task from review, they must post a `changes_requested`
 comment first and include its ID in the transition. This is enforced by the API.
@@ -846,15 +859,12 @@ A successful task execution produces all of the following:
 # Setup
 TASK_RUN_ID=$(ark gen-uuid)
 
-# Find work
-TASK_JSON=$(ark tasks list --status queued --limit 1)
-TASK_ID=$(echo "$TASK_JSON" | jq -r '.data[0].id')
-CONTEXT=$(echo "$TASK_JSON" | jq -c '.data[0].context')
-# e.g. CONTEXT = {"analyze": "sales data", "output_format": "summary_json"}
-
-# Claim
+# Atomically find and claim work
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+TASK_JSON=$(ark tasks claim-next)
+TASK_ID=$(echo "$TASK_JSON" | jq -r '.data.id // empty')
+CONTEXT=$(echo "$TASK_JSON" | jq -c '.data.context')
+# e.g. CONTEXT = {"analyze": "sales data", "output_format": "summary_json"}
 
 # Set workspace
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
@@ -866,7 +876,7 @@ ark tasks inputs list "$TASK_ID" | jq -r '.data[].path'
 
 # Post a progress note
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:1"
-ark tasks comments post "$TASK_ID" --type note --body \
+ark tasks comments post "$TASK_ID" --label note --body \
   "Loaded 2 input files. Starting analysis."
 
 # Upload a progress milestone at the start of analysis (phase 1 plan)
@@ -882,7 +892,7 @@ ark tasks outputs upload "$TASK_ID" ./phase-2-findings.md --type text --label pr
 # Determine confidence and post rationale as a comment
 CONFIDENCE=0.91
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: All figures verified against source CSVs; SKU ranking reproducible. No unresolved edge cases."
 
 # Write the final output — context specifies output_format: summary_json
@@ -907,7 +917,9 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 ark tasks list --status queued --limit 1      Find available work
 ark tasks list --status blocked --since <iso> --sort created_at --order asc --brief
                                               Scan oldest blockers with a small payload
-ark tasks claim <id>                          Claim it (queued → in_progress)
+ark tasks claim-next                          Atomically claim available work
+ark tasks claim <id>                          Re-claim a known re-queued task
+ark tasks ask-review <id> [--reason=]         Request review without completing
 ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read
 ark tasks inputs add <id> --path <p> --type   Register a reference-only source
@@ -916,7 +928,7 @@ ark tasks ingest-dir <dir> --map subdir-as-case --task-type <type> --batch-id <i
                                               Bulk-create case tasks and upload inputs (hold requires human key + audit_soat)
 ark tasks release-batch --batch-id <id> --limit <N>
                                               Release held batch tasks to draft (human key only)
-ark tasks comments post <id> --type note      Post progress updates
+ark tasks comments post <id> --label note     Post progress updates
 ark tasks outputs upload <id> <file> --type <t> --label report
                                               Upload the final deliverable (format per task context)
 ark tasks outputs upload <id> <file> --type <t> --label artifact
