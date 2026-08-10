@@ -17,8 +17,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `ark tasks find <text>` — searches task titles and business context fields
   through `GET /api/tasks/search`, returning task ID, status, and title with
   pagination metadata.
-- Exact `ark tasks list` filters for `--factura-key`, `--client-ref`,
-  `--batch-id`, and `--parent-task-id`.
+- Exact `ark tasks list` filters for `--type` / `--task-type`,
+  `--created-by-type`, `--factura-key`, `--client-ref`, `--batch-id`, and
+  `--parent` / `--parent-task-id`.
 - `ark tasks claim-next [--task-type]` — atomically claims the next
   profile-eligible task, removing the `list` + `claim` race between workers.
 - `ark tasks ask-review <id> [--reason]` — requests human review without
