@@ -2278,9 +2278,18 @@ cmd_audit() {
     exit 2
   }
 
-  local share_dir="${ARK_SHARE_DIR:-${ARK_INSTALL_SHARE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli}}"
-  local scripts_dir="${ARK_SCRIPTS_DIR:-${share_dir}/scripts}"
+  local ark_dir share_dir scripts_dir
+  ark_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  share_dir="${ARK_SHARE_DIR:-${ARK_INSTALL_SHARE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli}}"
+  scripts_dir="${ARK_SCRIPTS_DIR:-${share_dir}/scripts}"
   local script_path="${scripts_dir}/${operacion}.ts"
+
+  # Source checkouts and manual installs can still keep scripts beside ark.
+  # An explicit ARK_SCRIPTS_DIR remains authoritative.
+  if [[ ! -f "$script_path" && -z "${ARK_SCRIPTS_DIR:-}" && -f "${ark_dir}/scripts/${operacion}.ts" ]]; then
+    scripts_dir="${ark_dir}/scripts"
+    script_path="${scripts_dir}/${operacion}.ts"
+  fi
 
   if [[ ! -f "$script_path" ]]; then
     local available_ops=()
@@ -2672,6 +2681,7 @@ cmd_version() {
 cmd_update() {
   local here updater
   here="$(cd "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")" 2>/dev/null && pwd || dirname "$0")"
+  export ARK_SHARE_DIR="${ARK_SHARE_DIR:-${ARK_INSTALL_SHARE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli}}"
   updater="${here}/skill.sh"
   if [[ -x "$updater" ]]; then
     exec "$updater" "$@"

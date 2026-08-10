@@ -8,15 +8,17 @@
 #   curl — no checkout found (pulls raw files from GitHub)
 #
 # Env vars:
-#   ARK_UPDATE_SUDO=1          retry mv/cp via sudo when the prefix is not writable
+#   ARK_UPDATE_SUDO=1          retry protected destinations via sudo
 #   ARK_UPDATE_REPO=owner/name override (default: arkangelai/ark-cli)
 #   ARK_SHARE_DIR=/path       override shared data directory
+#   ARK_SCRIPTS_DIR=/path     override audit scripts directory
 set -euo pipefail
 
 REPO="${ARK_UPDATE_REPO:-arkangelai/ark-cli}"
 REF="main"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
 SHARE_DIR="${ARK_SHARE_DIR:-${ARK_INSTALL_SHARE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/tasks-ark-cli}}"
+SCRIPTS_DEST="${ARK_SCRIPTS_DIR:-${SHARE_DIR}/scripts}"
 
 err() {
   local code="$1" msg="$2" cur="${3:-unknown}"
@@ -32,16 +34,32 @@ resolve_path() {
 
 parse_version() { grep -m1 '^ARK_VERSION=' "$1" | cut -d'"' -f2; }
 
-embed_share_dir() {
-  local file="$1" first_line tmp="${1}.share-dir.$$"
-  {
-    IFS= read -r first_line
-    printf '%s\n' "$first_line"
-    printf 'ARK_INSTALL_SHARE_DIR=%q\n' "$SHARE_DIR"
-    cat
-  } < "$file" > "$tmp"
-  mv "$tmp" "$file"
+rewrite_share_dir_binding() {
+  local file="$1" bind_share_dir="$2" tmp line wrote_first=false
+  tmp="$(mktemp "${file}.share-dir.XXXXXX")"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" == ARK_INSTALL_SHARE_DIR=* ]] && continue
+    if [[ "$wrote_first" == "false" ]]; then
+      printf '%s\n' "$line" > "$tmp"
+      if [[ "$bind_share_dir" == "true" ]]; then
+        printf 'ARK_INSTALL_SHARE_DIR=%q\n' "$SHARE_DIR" >> "$tmp"
+      fi
+      wrote_first=true
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$file"
+
+  if [[ "$wrote_first" == "false" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$file"
 }
+
+embed_share_dir() { rewrite_share_dir_binding "$1" true; }
+strip_share_dir_binding() { rewrite_share_dir_binding "$1" false; }
 
 # Walk up looking for a git worktree whose origin URL contains $REPO.
 find_checkout() {
@@ -134,12 +152,51 @@ do_mv() {
   if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then sudo mv "$src" "$dst" && SUDO_USED="sudo" && return 0; fi
   return 1
 }
+shared_mkdir() {
+  local dir="$1"
+  mkdir -p "$dir" 2>/dev/null && return 0
+  if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then sudo mkdir -p "$dir" && SUDO_USED="sudo" && return 0; fi
+  return 1
+}
+shared_mv() {
+  local src="$1" dst="$2"
+  mv "$src" "$dst" 2>/dev/null && return 0
+  if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then sudo mv "$src" "$dst" && SUDO_USED="sudo" && return 0; fi
+  return 1
+}
+shared_rm_rf() {
+  local path="$1"
+  rm -rf "$path" 2>/dev/null && return 0
+  if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then sudo rm -rf "$path" && SUDO_USED="sudo" && return 0; fi
+  return 1
+}
+shared_preflight_dir() {
+  local dir="$1"
+  shared_mkdir "$dir" || return 1
+  [[ -w "$dir" ]] && return 0
+  if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then sudo test -w "$dir" && SUDO_USED="sudo" && return 0; fi
+  return 1
+}
+
+# Check every destination before replacing the binary so a protected shared
+# layout cannot leave an update half-applied.
+shared_preflight_dir "$SHARE_DIR" || {
+  err "write_denied" "cannot write shared directory ${SHARE_DIR}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
+if [ -d "${STAGE}/scripts" ]; then
+  shared_preflight_dir "$(dirname "$SCRIPTS_DEST")" || {
+    err "write_denied" "cannot write scripts directory $(dirname "$SCRIPTS_DEST"); re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
+fi
 
 do_cp "$TARGET_ARK" "$BACKUP" || {
   err "write_denied" "cannot backup ${TARGET_ARK}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
 
-embed_share_dir "${STAGE}/ark"
-embed_share_dir "${STAGE}/skill.sh"
+if [ -n "$CHECKOUT" ] && [[ "$TARGET_ARK" == "$CHECKOUT"/* ]]; then
+  strip_share_dir_binding "${STAGE}/ark"
+  strip_share_dir_binding "${STAGE}/skill.sh"
+else
+  embed_share_dir "${STAGE}/ark"
+  embed_share_dir "${STAGE}/skill.sh"
+fi
 chmod +x "${STAGE}/ark" "${STAGE}/install.sh" "${STAGE}/skill.sh"
 
 do_mv "${STAGE}/ark" "$TARGET_ARK" || {
@@ -147,25 +204,21 @@ do_mv "${STAGE}/ark" "$TARGET_ARK" || {
 do_mv "${STAGE}/skill.sh" "${PREFIX_DIR}/skill.sh" || {
   err "write_denied" "cannot place skill.sh in ${PREFIX_DIR}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
 
-mkdir -p "$SHARE_DIR"
-mv "${STAGE}/install.sh" "${SHARE_DIR}/install.sh"
+shared_mv "${STAGE}/install.sh" "${SHARE_DIR}/install.sh" || {
+  err "write_denied" "cannot place install.sh in ${SHARE_DIR}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
 
 if [ -d "${STAGE}/skills" ]; then
-  rm -rf "${SHARE_DIR}/skills"
-  mv "${STAGE}/skills" "${SHARE_DIR}/skills"
+  shared_rm_rf "${SHARE_DIR}/skills" || {
+    err "write_denied" "cannot replace skills/ in ${SHARE_DIR}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
+  shared_mv "${STAGE}/skills" "${SHARE_DIR}/skills" || {
+    err "write_denied" "cannot place skills/ in ${SHARE_DIR}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
 fi
 
 if [ -d "${STAGE}/scripts" ]; then
-  SCRIPTS_DEST="${SHARE_DIR}/scripts"
-  rm -rf "$SCRIPTS_DEST" 2>/dev/null || true
-  mv "${STAGE}/scripts" "$SCRIPTS_DEST" 2>/dev/null || {
-    if [ "${ARK_UPDATE_SUDO:-}" = "1" ]; then
-      sudo rm -rf "$SCRIPTS_DEST"
-      sudo mv "${STAGE}/scripts" "$SCRIPTS_DEST" && SUDO_USED="sudo"
-    else
-      err "write_denied" "cannot place scripts/ in ${SCRIPTS_DEST}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6
-    fi
-  }
+  shared_rm_rf "$SCRIPTS_DEST" || {
+    err "write_denied" "cannot replace scripts/ in ${SCRIPTS_DEST}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
+  shared_mv "${STAGE}/scripts" "$SCRIPTS_DEST" || {
+    err "write_denied" "cannot place scripts/ in ${SCRIPTS_DEST}; re-run with ARK_UPDATE_SUDO=1" "$CUR"; exit 6; }
 fi
 
 jq -n \
@@ -173,7 +226,7 @@ jq -n \
   --arg mode "$MODE" --arg checkout "$CHECKOUT" --arg ark "$TARGET_ARK" \
   --arg bak "$BACKUP" --arg skill "${PREFIX_DIR}/skill.sh" \
   --arg skills_dir "${SHARE_DIR}/skills" --arg install_sh "${SHARE_DIR}/install.sh" \
-  --arg scripts_dir "${SHARE_DIR}/scripts" \
+  --arg scripts_dir "$SCRIPTS_DEST" \
   --arg sudo_used "$SUDO_USED" \
   '{ok:true,cli_version:$cli,data:{
       mode:$mode, checkout:$checkout,

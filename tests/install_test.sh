@@ -55,6 +55,8 @@ explicit_output=$(
       --prefix "$explicit_prefix" \
       --share-dir "$explicit_share"
 )
+explicit_prefix="$(cd "$explicit_prefix" && pwd -P)"
+explicit_share="$(cd "$explicit_share" && pwd -P)"
 
 assert_file "$explicit_prefix/ark" "installer should copy ark to --prefix"
 assert_file "$explicit_prefix/skill.sh" "installer should copy skill.sh to --prefix"
@@ -65,10 +67,10 @@ assert_not_exists "$explicit_prefix/scripts" "installer should not put scripts b
 [[ "$(cat "$explicit_log")" == "version" ]] || fail "installer should run the installed ark version command"
 [[ "$explicit_output" == *"Installed version:   9.9.9"* ]] || fail "installer should print the verified version"
 
-# Under sudo, the default share directory belongs to the invoking user, even if
-# root's HOME and XDG_DATA_HOME are present.
+# Under sudo, the default share directory is a machine-wide, root-owned layout
+# derived from the binary prefix instead of either user's home directory.
 sudo_fixture="$TEST_DIR/sudo-source"
-sudo_prefix="$TEST_DIR/sudo-bin"
+sudo_prefix="$TEST_DIR/system/bin"
 sudo_home="$TEST_DIR/daemon-home"
 sudo_log="$TEST_DIR/sudo-version.log"
 fake_bin="$TEST_DIR/fake-bin"
@@ -93,11 +95,12 @@ sudo_output=$(
     ARK_INSTALL_TEST_LOG="$sudo_log" \
     bash "$sudo_fixture/install.sh" --prefix "$sudo_prefix"
 )
-sudo_share="$sudo_home/.local/share/tasks-ark-cli"
-assert_file "$sudo_share/skills/SKILL.md" "sudo install should use SUDO_USER's home for skills"
-assert_file "$sudo_share/scripts/fixture.ts" "sudo install should use SUDO_USER's home for scripts"
+sudo_share="$(cd "$TEST_DIR/system/share/tasks-ark-cli" && pwd -P)"
+assert_file "$sudo_share/skills/SKILL.md" "sudo install should use the system share for skills"
+assert_file "$sudo_share/scripts/fixture.ts" "sudo install should use the system share for scripts"
 assert_not_exists "$TEST_DIR/root-xdg/tasks-ark-cli" "sudo install should not use root's XDG data directory"
-[[ "$sudo_output" == *"Share files:         $sudo_share"* ]] || fail "installer should report the sudo user's share directory"
+assert_not_exists "$sudo_home/.local/share/tasks-ark-cli" "sudo install should not bind a global CLI to SUDO_USER's home"
+[[ "$sudo_output" == *"Share files:         $sudo_share"* ]] || fail "installer should report the system share directory"
 
 # Unknown options are argument errors.
 set +e
@@ -128,6 +131,70 @@ set -e
 [[ $broken_status -ne 0 ]] || fail "installer should fail when installed ark version fails"
 grep -Fq 'installed ark failed to run' "$TEST_DIR/broken.err" || fail "installer should explain version verification failure"
 
+# A successful process with an invalid version envelope is still a failed
+# installation verification.
+invalid_fixture="$TEST_DIR/invalid-source"
+invalid_prefix="$TEST_DIR/invalid-bin"
+invalid_share="$TEST_DIR/invalid-share"
+make_fixture "$invalid_fixture"
+cat > "$invalid_fixture/ark" <<'INVALID'
+#!/usr/bin/env bash
+printf '%s\n' '{"ok":true,"data":{}}'
+INVALID
+chmod +x "$invalid_fixture/ark"
+
+set +e
+bash "$invalid_fixture/install.sh" \
+  --prefix "$invalid_prefix" \
+  --share-dir "$invalid_share" \
+  >"$TEST_DIR/invalid.out" 2>"$TEST_DIR/invalid.err"
+invalid_status=$?
+set -e
+[[ $invalid_status -ne 0 ]] || fail "installer should reject a version response without a version"
+grep -Fq 'installed ark returned an invalid version response' "$TEST_DIR/invalid.err" || fail "installer should explain invalid version output"
+
+# Installing over a source fixture must not truncate the source executable.
+self_fixture="$TEST_DIR/self-source"
+self_share="$TEST_DIR/self-share"
+self_log="$TEST_DIR/self-version.log"
+make_fixture "$self_fixture"
+ARK_INSTALL_TEST_LOG="$self_log" \
+  bash "$self_fixture/install.sh" \
+    --prefix "$self_fixture" \
+    --share-dir "$self_share" >/dev/null
+[[ "$(cat "$self_log")" == "version" ]] || fail "self-prefix install should leave ark executable"
+grep -Fq 'ARK_VERSION="9.9.9"' "$self_fixture/ark" || fail "self-prefix install should preserve the source body"
+
+# Relative explicit paths are resolved before they are embedded so runtime
+# lookup does not depend on the caller's current directory.
+relative_fixture="$TEST_DIR/relative-source"
+relative_prefix="$TEST_DIR/relative-bin"
+relative_base="$TEST_DIR/relative-base"
+relative_fake_bin="$TEST_DIR/relative-fake-bin"
+relative_log="$TEST_DIR/relative-npx.log"
+mkdir -p "$relative_base" "$relative_fake_bin"
+make_fixture "$relative_fixture"
+cp "$ROOT_DIR/ark" "$relative_fixture/ark"
+cat > "$relative_fake_bin/npx" <<'NPX'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${ARK_INSTALL_TEST_NPX_LOG:?}"
+NPX
+chmod +x "$relative_fixture/ark" "$relative_fake_bin/npx"
+(
+  cd "$relative_base"
+  bash "$relative_fixture/install.sh" \
+    --prefix "$relative_prefix" \
+    --share-dir "relative share" >/dev/null
+)
+relative_share="$(cd "$relative_base/relative share" && pwd -P)"
+(
+  cd "$TEST_DIR"
+  PATH="$relative_fake_bin:$PATH" \
+    ARK_INSTALL_TEST_NPX_LOG="$relative_log" \
+    "$relative_prefix/ark" audit fixture
+)
+[[ "$(cat "$relative_log")" == "tsx $relative_share/scripts/fixture.ts" ]] || fail "relative share path should remain valid from another directory"
+
 # The runtime and updater must use the same shared scripts location as the
 # installer so a later update does not move data back into the binary prefix.
 audit_home="$TEST_DIR/audit-home"
@@ -147,6 +214,15 @@ HOME="$audit_home" \
   ARK_INSTALL_TEST_NPX_LOG="$audit_log" \
   "$ROOT_DIR/ark" audit fixture
 [[ "$(cat "$audit_log")" == "tsx $audit_script" ]] || fail "ark audit should default to the shared scripts directory"
+
+# Source checkouts and legacy self-contained layouts retain the adjacent
+# scripts fallback when the primary shared directory has no matching script.
+adjacent_log="$TEST_DIR/adjacent-npx.log"
+HOME="$TEST_DIR/adjacent-home" \
+  PATH="$audit_fake_bin:$PATH" \
+  ARK_INSTALL_TEST_NPX_LOG="$adjacent_log" \
+  "$ROOT_DIR/ark" audit send-denial-mail test-task
+[[ "$(cat "$adjacent_log")" == "tsx $ROOT_DIR/scripts/send-denial-mail.ts test-task" ]] || fail "ark audit should fall back to scripts beside ark"
 
 # Updating an explicit installation must retain its bound share directory and
 # must fetch from the documented default repository.
@@ -192,7 +268,15 @@ case "$url" in
     cp "${ARK_INSTALL_TEST_SOURCE_DIR:?}/install.sh" "$output_file"
     ;;
   https://raw.githubusercontent.com/arkangelai/ark-cli/main/skill.sh)
-    cp "${ARK_INSTALL_TEST_SOURCE_DIR:?}/skill.sh" "$output_file"
+    if [[ -n "$output_file" ]]; then
+      cp "${ARK_INSTALL_TEST_SOURCE_DIR:?}/skill.sh" "$output_file"
+    else
+      cat <<'UPDATER'
+#!/usr/bin/env bash
+jq -n --arg share_dir "${ARK_SHARE_DIR:-}" \
+  '{ok:true,data:{share_dir:$share_dir}}'
+UPDATER
+    fi
     ;;
   https://raw.githubusercontent.com/arkangelai/ark-cli/main/scripts/fixture.ts)
     printf 'console.log("updated");\n' > "$output_file"
@@ -213,6 +297,32 @@ printf '%s\n' "$*" > "${ARK_INSTALL_TEST_NPX_LOG:?}"
 NPX
 chmod +x "$update_fake_bin/curl" "$update_fake_bin/npx"
 
+# A protected shared directory is rejected before the installed binary is
+# replaced, with the updater's structured permission error.
+protected_fixture="$TEST_DIR/protected-source"
+protected_prefix="$TEST_DIR/protected-bin"
+protected_share="$TEST_DIR/protected-share"
+protected_log="$TEST_DIR/protected-version.log"
+make_fixture "$protected_fixture"
+ARK_INSTALL_TEST_LOG="$protected_log" \
+  bash "$protected_fixture/install.sh" \
+    --prefix "$protected_prefix" \
+    --share-dir "$protected_share" >/dev/null
+chmod 0555 "$protected_share"
+set +e
+HOME="$update_home" \
+  PATH="$update_fake_bin:$protected_prefix:$PATH" \
+  ARK_INSTALL_TEST_CURL_LOG="$update_curl_log" \
+  ARK_INSTALL_TEST_SOURCE_DIR="$ROOT_DIR" \
+  "$protected_prefix/skill.sh" \
+  >"$TEST_DIR/protected.out" 2>"$TEST_DIR/protected.err"
+protected_status=$?
+set -e
+chmod 0755 "$protected_share"
+[[ $protected_status -eq 6 ]] || fail "protected share preflight should exit 6 (got $protected_status)"
+grep -Fq '"code":"write_denied"' "$TEST_DIR/protected.err" || fail "protected share preflight should emit structured write_denied"
+grep -Fq 'ARK_VERSION="9.9.9"' "$protected_prefix/ark" || fail "protected share preflight should run before replacing ark"
+
 update_output=$(
   HOME="$update_home" \
     PATH="$update_fake_bin:$explicit_prefix:$PATH" \
@@ -227,6 +337,44 @@ printf '%s' "$update_output" | jq -e \
 grep -Fq 'console.log("updated");' "$explicit_share/scripts/fixture.ts" || fail "updater should refresh scripts in the bound share directory"
 assert_not_exists "$update_home/.local/share/tasks-ark-cli/scripts" "updater should not split an explicit installation into HOME"
 assert_not_exists "$explicit_prefix/scripts" "updater should not place scripts beside binaries"
+
+# The documented scripts override is shared by runtime and updater lookup.
+override_scripts="$TEST_DIR/override-scripts"
+# Restore the older fixture version so this second updater invocation is not
+# short-circuited as already current.
+ARK_INSTALL_TEST_LOG="$explicit_log" \
+  bash "$explicit_fixture/install.sh" \
+    --prefix "$explicit_prefix" \
+    --share-dir "$explicit_share" >/dev/null
+override_output=$(
+  HOME="$update_home" \
+    PATH="$update_fake_bin:$explicit_prefix:$PATH" \
+    ARK_INSTALL_TEST_CURL_LOG="$update_curl_log" \
+    ARK_INSTALL_TEST_SOURCE_DIR="$ROOT_DIR" \
+    ARK_SCRIPTS_DIR="$override_scripts" \
+    "$explicit_prefix/skill.sh"
+)
+printf '%s' "$override_output" | jq -e \
+  --arg scripts_dir "$override_scripts" \
+  '.data.scripts_dir == $scripts_dir' >/dev/null || fail "updater should report ARK_SCRIPTS_DIR"
+grep -Fq 'console.log("updated");' "$override_scripts/fixture.ts" || fail "updater should refresh ARK_SCRIPTS_DIR"
+
+# If the installed updater is missing, ark exports its embedded share binding
+# to the freshly downloaded fallback updater.
+mv "$explicit_prefix/skill.sh" "$explicit_prefix/skill.sh.saved"
+fallback_output=$(
+  HOME="$update_home" \
+    PATH="$update_fake_bin:$explicit_prefix:$PATH" \
+    ARK_INSTALL_TEST_CURL_LOG="$update_curl_log" \
+    ARK_INSTALL_TEST_SOURCE_DIR="$ROOT_DIR" \
+    "$explicit_prefix/ark" update
+)
+printf '%s' "$fallback_output" | jq -e \
+  --arg share_dir "$explicit_share" \
+  '.data.share_dir == $share_dir' >/dev/null || fail "curl fallback updater should inherit the installed share directory"
+mv "$explicit_prefix/skill.sh.saved" "$explicit_prefix/skill.sh"
+
+[[ "$(grep -c '^ARK_INSTALL_SHARE_DIR=' "$explicit_prefix/ark")" -eq 1 ]] || fail "updates should leave exactly one embedded share binding"
 
 HOME="$update_home" \
   PATH="$update_fake_bin:$PATH" \

@@ -23,10 +23,12 @@ chmod +x /usr/local/bin/ark
 ```
 
 The installer places executables in the binary prefix and keeps `skills/`,
-`scripts/`, and its update copy under the shared data directory. When run with
-`sudo`, its default shared data directory is resolved from `SUDO_USER` instead
-of root's home. `ARK_SHARE_DIR` and `ARK_SCRIPTS_DIR` can override runtime and
-update lookup paths for custom layouts.
+`scripts/`, and its update copy under the shared data directory. A root or
+`sudo` install defaults to the system share beside the prefix (for example,
+`/usr/local/share/tasks-ark-cli` for `/usr/local/bin`), rather than any user's
+home. Non-root installs default to the user's XDG data directory.
+`ARK_SHARE_DIR` and `ARK_SCRIPTS_DIR` can override runtime and update lookup
+paths for custom layouts.
 
 ## Update
 
