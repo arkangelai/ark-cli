@@ -233,7 +233,7 @@ per step — so a reviewer can scan what you are doing without opening anything:
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:1"
-ark tasks comments post "$TASK_ID" --type note --body "Finished data collection, starting analysis."
+ark tasks comments post "$TASK_ID" --label note --body "Finished data collection, starting analysis."
 ```
 
 Increment the suffix (`:note:1`, `:note:2`, ...) per note.
@@ -298,7 +298,7 @@ the score in a shell variable, then post the rationale as a note comment:
 ```bash
 CONFIDENCE=0.87
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Verified against 2 source documents; one edge case unresolved: Q4 breakdown missing for region EU-West."
 ```
 
@@ -458,7 +458,7 @@ cannot see the run boundary.)
 ```bash
 CONFIDENCE=0.90
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: Addressed <specific feedback>; <what changed and why>."
 
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
@@ -698,6 +698,25 @@ Use `context-set` whenever you need to annotate the task record with facts produ
 
 ## Gotchas
 
+**Filter JSON using each resource's actual field names.**
+
+| Resource | Category/type field | Related field |
+|---|---|---|
+| comments | `label` | `author_type` |
+| outputs | `output_type` | `label` |
+| events | `actor_type` | — |
+| tasks | `task_type` | `created_by_type` |
+
+Post comments with `--label` and filter them with `.label`, for example:
+
+```bash
+ark tasks comments post "$TASK_ID" --label blocker --body "Missing OCR"
+ark tasks comments list "$TASK_ID" | jq '.data[] | select(.label == "blocker")'
+```
+
+The legacy `comments post --type` spelling remains accepted only for backward
+compatibility. Do not use it in new commands.
+
 **`review → queued` requires a `comment_id`.**
 When a human re-queues a task from review, they must post a `changes_requested`
 comment first and include its ID in the transition. This is enforced by the API.
@@ -866,7 +885,7 @@ ark tasks inputs list "$TASK_ID" | jq -r '.data[].path'
 
 # Post a progress note
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:1"
-ark tasks comments post "$TASK_ID" --type note --body \
+ark tasks comments post "$TASK_ID" --label note --body \
   "Loaded 2 input files. Starting analysis."
 
 # Upload a progress milestone at the start of analysis (phase 1 plan)
@@ -882,7 +901,7 @@ ark tasks outputs upload "$TASK_ID" ./phase-2-findings.md --type text --label pr
 # Determine confidence and post rationale as a comment
 CONFIDENCE=0.91
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
-ark tasks comments post "$TASK_ID" --type note \
+ark tasks comments post "$TASK_ID" --label note \
   --body "Confidence ${CONFIDENCE}: All figures verified against source CSVs; SKU ranking reproducible. No unresolved edge cases."
 
 # Write the final output — context specifies output_format: summary_json
@@ -914,7 +933,7 @@ ark tasks ingest-dir <dir> --map subdir-as-case --task-type <type> --batch-id <i
                                               Bulk-create case tasks and upload inputs (hold requires human key + audit_soat)
 ark tasks release-batch --batch-id <id> --limit <N>
                                               Release held batch tasks to draft (human key only)
-ark tasks comments post <id> --type note      Post progress updates
+ark tasks comments post <id> --label note     Post progress updates
 ark tasks outputs upload <id> <file> --type <t> --label report
                                               Upload the final deliverable (format per task context)
 ark tasks outputs upload <id> <file> --type <t> --label artifact

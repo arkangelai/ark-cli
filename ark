@@ -350,14 +350,14 @@ next_cmds() {
       upload_output)   cmd="ark tasks outputs upload ${id} <file-path> --type <type> --label <label>" ;;
       upload_input)    cmd="ark tasks inputs upload ${id} <file-path>" ;;
       document_url)    cmd="ark tasks documents url ${id} <input|output> <record-id>" ;;
-      post_note)       cmd="ark tasks comments post ${id} --type note --body \"<body>\"" ;;
+      post_note)       cmd="ark tasks comments post ${id} --label note --body \"<body>\"" ;;
       register_input)  cmd="ark tasks inputs add ${id} --path \"<path>\"" ;;
       approve)         cmd="ark tasks status ${id} --status done" ;;
       request_changes) cmd="ark tasks status ${id} --status queued --comment-id <comment-id>" ;;
       queue|requeue)   cmd="ark tasks status ${id} --status queued" ;;
       cancel)          cmd="ark tasks status ${id} --status cancelled" ;;
       archive)         cmd="ark tasks status ${id} --status archived" ;;
-      comment)         cmd="ark tasks comments post ${id} --type comment --body \"<body>\"" ;;
+      comment)         cmd="ark tasks comments post ${id} --label comment --body \"<body>\"" ;;
       self)            cmd="ark tasks get ${id}" ;;
       *)               cmd="ark tasks get ${id}" ;;
     esac
@@ -1398,11 +1398,14 @@ cmd_tasks_comments_list() {
 # ─── tasks comments post ───────────────────────────────────────────────────────
 cmd_tasks_comments_post() {
   local id="${1:-}"; shift || true
-  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks comments post <id> --type <type> --body <body>"; exit 2; }
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks comments post <id> --label <label> --body <body>"; exit 2; }
 
   local label="" body_text=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --label=*) label="${1#--label=}" ;;
+      --label)   shift; label="$1" ;;
+      # Backward-compatible alias. Keep hidden from help so new callers use the API field name.
       --type=*) label="${1#--type=}" ;;
       --type)   shift; label="$1" ;;
       --body=*) body_text="${1#--body=}" ;;
@@ -1410,7 +1413,7 @@ cmd_tasks_comments_post() {
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  [[ -z "$label" || -z "$body_text" ]] && { err_json "bad_argument" "--type and --body are required" "false" "{}" "ark tasks comments post ${id} --type <type> --body \"<body>\""; exit 2; }
+  [[ -z "$label" || -z "$body_text" ]] && { err_json "bad_argument" "--label and --body are required" "false" "{}" "ark tasks comments post ${id} --label <label> --body \"<body>\""; exit 2; }
 
   local body; body=$(jq -n --arg b "$body_text" --arg l "$label" '{body:$b,label:$l}')
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/comments" "$body"; return; }
@@ -2196,9 +2199,27 @@ cmd_skills() {
       },
       enums: {
         task_status:  ["hold","draft","queued","in_progress","blocked","review","done","archived","cancelled"],
+        comment_label: ["note","blocker","comment","approved","changes_requested"],
         output_type:  ["json","text","file","screenshot","log"],
         output_label: ["report","artifact","error_log","progress","diff"],
         path_type:    ["filesystem","storage","url"]
+      },
+      resource_fields: {
+        comments: {
+          label: "comment category; set with comments post --label",
+          author_type: "comment author kind"
+        },
+        outputs: {
+          output_type: "deliverable format; set with outputs submit/upload --type",
+          label: "deliverable role; set with outputs submit/upload --label"
+        },
+        events: {
+          actor_type: "event actor kind"
+        },
+        tasks: {
+          task_type: "task workflow kind",
+          created_by_type: "task creator kind"
+        }
       },
       upload_limits: {
         max_file_bytes: 524288000,
@@ -2406,7 +2427,7 @@ INPUTS
 COMMENTS
   ark tasks comments list <id>       List all comments
   ark tasks comments post <id>       Post a comment
-    --type=note|blocker|comment|approved|changes_requested  --body=<text>
+    --label=note|blocker|comment|approved|changes_requested  --body=<text>
   ark tasks comments edit <id> <comment-id>   Edit own comment body (human only)
     --body=<text>
   ark tasks comments delete <id> <comment-id>  Delete own comment (human only)

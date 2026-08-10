@@ -243,7 +243,7 @@ Arkangel AI"
 
   if [[ ${#PATCH_ERRORS[@]} -gt 0 ]]; then
     export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:patch-errors"
-    ark tasks comments post "$TASK_ID" --type note \
+    ark tasks comments post "$TASK_ID" --label note \
       --body "context-set reply_sent falló para las siguientes tareas: ${PATCH_ERRORS[*]}"
   fi
 
@@ -256,7 +256,7 @@ else
   FIRST_LINE=$(head -n1 "$STDERR_FILE")
 
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note"
-  ark tasks comments post "$TASK_ID" --type note --body "$STDERR_CONTENT"
+  ark tasks comments post "$TASK_ID" --label note --body "$STDERR_CONTENT"
 
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:block"
   ark tasks block "$TASK_ID" \
