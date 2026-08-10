@@ -8,6 +8,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 ### Added
+- `ark tasks list` now supports creation-time windows (`--since`, `--until`),
+  server-side ordering (`--sort`, `--order`), and field projection (`--fields`
+  or the `--brief` shorthand) to avoid full-history scans and oversized pages.
 - `ark tasks ingest-dir <dir>` — bulk directory ingestion where each
   subdirectory is a case/task. Supports `--map subdir-as-case`, `--task-type`,
   `--status`, `--priority`, `--batch-id`, bounded upload concurrency,

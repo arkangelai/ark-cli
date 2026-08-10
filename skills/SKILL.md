@@ -905,6 +905,8 @@ ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
 
 ```
 ark tasks list --status queued --limit 1      Find available work
+ark tasks list --status blocked --since <iso> --sort created_at --order asc --brief
+                                              Scan oldest blockers with a small payload
 ark tasks claim <id>                          Claim it (queued → in_progress)
 ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read

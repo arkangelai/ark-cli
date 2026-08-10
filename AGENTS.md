@@ -157,7 +157,7 @@ Use these to read and mutate task state:
 
 | Command | Purpose |
 |---|---|
-| `ark tasks list` | Fetch queued tasks |
+| `ark tasks list` | Fetch tasks; supports `--since`, `--until`, `--sort`, `--order`, `--fields`, and `--brief` |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |
 | `ark tasks status <id> --status draft` | Release a held task into draft/OCR |
