@@ -37,7 +37,7 @@ config_file="${HOME}/.config/ark/config"
 assert_eq "api-key=${api_key}" "$(grep '^api-key=' "$config_file")" \
   "config set should persist the full api-key"
 
-config_mode="$(stat -f '%Lp' "$config_file" 2>/dev/null || stat -c '%a' "$config_file")"
+config_mode="$(stat -c '%a' "$config_file" 2>/dev/null || stat -f '%Lp' "$config_file")"
 assert_eq "600" "$config_mode" "config file should remain owner-readable only"
 
 list_output="$("$ARK_BIN" config list)"
