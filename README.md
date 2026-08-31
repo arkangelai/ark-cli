@@ -100,6 +100,36 @@ TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
 [[ -n "$TASK_ID" ]] || exit 0
 ```
 
+For a claimed task with `context.type == "soat_similar_review_scan"`, keep its
+task ID and `run_id`. Page all direct-review targets, preserving the returned
+`snapshot_at` literally, and execute at most 8 reviews concurrently:
+
+```bash
+PAGE=$(ark tasks similar-reviews list "$TASK_ID" --page-size 100 --json)
+ark soat corrections similar-review <case-id> \
+  --scan-task-id "$TASK_ID" --item-key <item-key> \
+  --baseline-output-id <output-id> --json
+```
+
+Continue until `meta.has_more=false`. Preserve each successful `data` object,
+convert exhausted target errors to local `decision=failed` results, and validate
+counters, result length, and unique targets. Persist the report before status:
+
+```bash
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
+ark tasks outputs create "$TASK_ID" --output-type json --label report \
+  --run-id "$RUN_ID" --data-file report.json --json
+
+# Continue only after meta.http_status == 201.
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
+ark tasks status "$TASK_ID" --status done --confidence-score 1 \
+  --run-id "$RUN_ID" --json
+```
+
+Reports must be smaller than 500 KiB. Never call `ask-review`,
+`review/decision`, `corrections/apply`, create review tasks, or publish returned
+proposals automatically.
+
 **2. Set up workspace and read inputs**
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
@@ -320,9 +350,10 @@ ark tasks create           --title= [--description=] [--priority=] [--deadline=]
 ark tasks update <id>      --log-path=
 ark tasks context <id>     --data='<json>' | --clear          # human only
 ark tasks context-set <id> --set key=value [--set key2=val2]  # agent only, shallow merge
-ark tasks status <id>      --status= [--confidence=] [--comment-id=]
+ark tasks status <id>      --status= [--confidence=|--confidence-score=] [--comment-id=] [--run-id=] [--json]
 ark tasks claim <id>
-ark tasks claim-next        [--task-type=]
+ark tasks claim-next        [--task-type=] [--worker-id=] [--json]
+ark tasks similar-reviews list <scan-task-id> [--page-size=100] [--after-id=] [--snapshot-at=] [--json]
 ark tasks ask-review <id>   [--reason=]
 ark tasks complete <id>    --confidence=
 ark tasks block <id>       --reason=
@@ -354,9 +385,11 @@ ark tasks comments edit <id> <comment-id>   --body=
 ark tasks comments delete <id> <comment-id>
 ark tasks outputs list <id>
 ark tasks outputs download <id> [--label=report] [--version=N] [-o <file> | --output=<file>]
-ark tasks outputs submit <id>  --type=json|text|file|screenshot --label= [--data=] [--storage-path=] [--size=]
+ark tasks outputs submit <id>  --type=json|text|file|screenshot --label= [--data=|--data-file=] [--storage-path=] [--size=] [--run-id=]
+ark tasks outputs create <id>  # alias of submit; also accepts --output-type and --json
 ark tasks outputs upload <id> <file-path> --type= --label= [--local-path=]
 ark tasks outputs get <id> <output-id>
+ark soat corrections similar-review <case-id> --scan-task-id= --item-key= --baseline-output-id= [--json]
 ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]
 ark knowledge files url <path> <name>   [--task-type=audit] [--output=<local-path>]
 ark knowledge upload <file>    --folder= [--subfolder=] [--description=]

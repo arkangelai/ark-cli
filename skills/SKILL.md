@@ -6,7 +6,7 @@ description: >
   outputs, and completing with a confidence score. Also handles blockers,
   follow-on task creation, and re-execution after human feedback. Use when you
   are an agent that needs to pick up and execute tasks from the queue.
-version: "1.4"
+version: "1.6"
 compatibility: Requires ark CLI installed and configured with a valid api-key and url.
 ---
 
@@ -71,6 +71,42 @@ the message to the user. Exit code `6` means the install prefix is not writable.
 | `audit_soat` | Audita factura SOAT |
 | `soat_glosa_mail` | Comunicación de glosas SOAT |
 | `batch-denial-mail` | Delega a `ark audit send-denial-mail` — no razonar |
+
+---
+
+## Workflow — Review directo de facturas SOAT similares
+
+Use only when the claimed task is `general` and its context type is
+`soat_similar_review_scan`. Keep its task ID and `run_id`; the task description
+is authoritative. One coordinator pages all targets and executes the returned
+requests with at most 8 concurrent processes.
+
+```bash
+PAGE=$(ark tasks similar-reviews list "$TASK_ID" --page-size 100 --json)
+ark soat corrections similar-review <case-id> \
+  --scan-task-id "$TASK_ID" --item-key <item-key> \
+  --baseline-output-id <output-id> --json
+```
+
+While `meta.has_more` is true, pass `meta.next_after_id` as `--after-id` and
+echo `meta.snapshot_at` verbatim as `--snapshot-at`. Preserve successful `data`
+objects and record permanent or exhausted errors as local `decision=failed`
+results. Validate counters, one result per matched target, and target uniqueness.
+
+```bash
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
+ark tasks outputs create "$TASK_ID" --output-type json --label report \
+  --run-id "$RUN_ID" --data-file report.json --json
+
+# Continue only after meta.http_status == 201.
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
+ark tasks status "$TASK_ID" --status done --confidence-score 1 \
+  --run-id "$RUN_ID" --json
+```
+
+Do not complete if the report reaches 500 KiB. On `409 stale_execution`,
+discard local work. Never call `ask-review`, `review/decision`,
+`corrections/apply`, create review tasks, or publish proposals automatically.
 
 ---
 
