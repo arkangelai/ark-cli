@@ -64,6 +64,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.6.0] — 2026-08-31
+
+### Added
+- `ark tasks similar-reviews list` for snapshot/keyset pagination of direct
+  SOAT review targets.
+- `ark soat corrections similar-review` for one read-only review, with bounded
+  retries for network failures, `429`, and `5xx` only.
+- Literal compatibility aliases: `claim-next --worker-id --json`,
+  `outputs create --output-type --data-file --run-id`, and
+  `tasks status --confidence-score --run-id`.
+- JSON file validation and an exclusive 500 KiB inline-report limit.
+
+### Changed
+- HTTP errors include numeric `error.status` while preserving API code,
+  message, detail, request ID, and exit-code behavior.
+- Discovery, direct-review, and report bodies are redacted from debug logs.
+- The capability map and agent guides document pagination, maximum concurrency
+  8, report invariants, and the required `report -> done` order.
+
+---
+
 ## [0.5.0] — 2026-06-18
 
 ### Added

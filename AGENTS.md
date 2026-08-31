@@ -55,7 +55,7 @@ Every successful command outputs this shape to stdout:
 ```json
 {
   "ok": true,
-  "cli_version": "0.5.0",
+  "cli_version": "0.6.0",
   "data": { },
   "_links": { },
   "next_commands": {
@@ -82,8 +82,9 @@ Error envelope goes to **stderr**:
 ```json
 {
   "ok": false,
-  "cli_version": "0.5.0",
+  "cli_version": "0.6.0",
   "error": {
+    "status": 409,
     "code": "invalid_status_transition",
     "message": "Cannot transition from 'in_progress' to 'draft'",
     "retryable": false,
@@ -190,13 +191,15 @@ Use these to read and mutate task state:
 | `ark tasks find <text>` | Search task title and business context; returns ID, status, and title |
 | `ark tasks get <id>` | Read a single task with next_commands |
 | `ark tasks claim <id>` | Transition queued → in_progress |
-| `ark tasks claim-next [--task-type]` | Atomically claim the next profile-eligible queued task |
+| `ark tasks claim-next [--task-type] [--worker-id] [--json]` | Atomically claim the next profile-eligible queued task |
+| `ark tasks similar-reviews list <id>` | Page direct-review targets for a similar-invoice scan |
 | `ark tasks ask-review <id> [--reason]` | Request human review without completing the task |
 | `ark tasks status <id> --status draft` | Release a held task into draft/OCR |
 | `ark tasks update <id> --log-path` | Set workspace storage path |
 | `ark tasks context-set <id> --set key=value` | **Merge fields into context** (preserves existing fields) |
 | `ark tasks outputs upload <id>` | Push output file and record it |
-| `ark tasks outputs submit <id>` | Register already-staged or inline output |
+| `ark tasks outputs submit/create <id>` | Register already-staged or inline output; `create` supports issue-compatible aliases |
+| `ark soat corrections similar-review <case-id>` | Run one read-only direct review with bounded transient retries |
 | `ark tasks outputs download <id> [--label report] [--version N] [-o file]` | Download the latest matching output; defaults to the latest report and stdout |
 | `ark tasks complete <id> --confidence` | Transition to done or review |
 | `ark tasks block <id> --reason` | Signal blocker, transition to blocked |
@@ -463,6 +466,36 @@ else
 fi
 rm -f "$STDERR_FILE"
 ```
+
+---
+
+## Workflow — Review directo de facturas similares
+
+Use only for a claimed `general` task with
+`context.type == "soat_similar_review_scan"`. Save its task ID and `run_id`.
+Page with `ark tasks similar-reviews list`, echoing `snapshot_at` verbatim on
+subsequent pages, and run the returned direct-review requests with a maximum of
+8 concurrent processes.
+
+Preserve each successful endpoint `data`; convert permanent or exhausted target
+errors to local `decision=failed` results. Before persistence, validate the
+accumulated `scanned`/`matched` counters, one result per matched target, decision
+counters, and unique `case_id + task_id + output_id + item_key` values.
+
+```bash
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
+ark tasks outputs create "$TASK_ID" --output-type json --label report \
+  --run-id "$RUN_ID" --data-file report.json --json
+
+# Continue only after meta.http_status == 201.
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
+ark tasks status "$TASK_ID" --status done --confidence-score 1 \
+  --run-id "$RUN_ID" --json
+```
+
+Do not complete when the report reaches 500 KiB. On `409 stale_execution`,
+discard local work. Never call `ask-review`, `review/decision`,
+`corrections/apply`, create review tasks, or publish proposals automatically.
 
 ---
 

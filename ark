@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARK_VERSION="0.5.0"
+ARK_VERSION="0.6.0"
 ARK_CONFIG_FILE="${ARK_CONFIG_FILE:-${HOME}/.config/ark/config}"
 ARK_DEFAULT_API_URL="https://audit.arkangel.ai"
 ARK_DEFAULT_LIMIT="20"
@@ -106,11 +106,26 @@ err_json() {
     '{ok:false,cli_version:$v,error:{code:$code,message:$msg,retryable:$retryable,detail:$detail},suggestion:$suggestion}' >&2
 }
 
-# ─── HTTP ──────────────────────────────────────────────────────────────────────
-HTTP_STATUS="" HTTP_BODY="" HTTP_REQUEST_ID="" HTTP_IDEMPOTENT_REPLAY="false"
+err_json_status() {
+  local status="$1" code="$2" msg="$3" retryable="$4" detail="${5}" suggestion="${6:-}"
+  [[ -z "$detail" ]] && detail="{}"
+  jq -n \
+    --arg v "$ARK_VERSION" --argjson status "$status" --arg code "$code" --arg msg "$msg" \
+    --argjson retryable "$retryable" --argjson detail "$detail" \
+    --arg suggestion "$suggestion" --arg rid "${HTTP_REQUEST_ID:-}" \
+    '{ok:false,cli_version:$v,error:{status:$status,code:$code,message:$msg,retryable:$retryable,detail:$detail},suggestion:$suggestion,request_id:$rid}' >&2
+}
 
-http_request() {
-  local method="$1" path="$2" body="${3:-}" idem_key="${4:-}"
+force_json_output() {
+  HUMAN_OUTPUT=false
+  ARK_FORMAT=json
+}
+
+# ─── HTTP ──────────────────────────────────────────────────────────────────────
+HTTP_STATUS="" HTTP_BODY="" HTTP_REQUEST_ID="" HTTP_IDEMPOTENT_REPLAY="false" HTTP_RETRY_AFTER=""
+
+http_request_once() {
+  local method="$1" path="$2" body="${3:-}" idem_key="${4:-}" worker_id="${5:-}" sensitive="${6:-false}"
   local token; token=$(resolve_api_key)
   local url; url="$(resolve_api_url)${path}"
   local body_file header_file
@@ -124,9 +139,16 @@ http_request() {
     -H "Content-Type: application/json"
   )
   [[ -n "$idem_key" ]] && args+=(-H "Idempotency-Key: ${idem_key}")
+  [[ -n "$worker_id" ]] && args+=(-H "X-Worker-Id: ${worker_id}")
   [[ -n "$body" ]] && args+=(--data "$body")
 
-  [[ "${ARK_DEBUG:-0}" -ge 2 ]] && echo "[DEBUG] ${method} ${url}${body:+ body=${body}}" >&2
+  if [[ "${ARK_DEBUG:-0}" -ge 2 ]]; then
+    if [[ "$sensitive" == "true" ]]; then
+      echo "[DEBUG] ${method} ${url} body=[REDACTED]" >&2
+    else
+      echo "[DEBUG] ${method} ${url}${body:+ body=${body}}" >&2
+    fi
+  fi
 
   local exit_code=0
   set +e
@@ -136,16 +158,30 @@ http_request() {
 
   HTTP_BODY=$(cat "$body_file")
   HTTP_REQUEST_ID=$(grep -i '^x-request-id:' "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}' || true)
+  HTTP_RETRY_AFTER=$(grep -i '^retry-after:' "$header_file" 2>/dev/null | tr -d '\r' | cut -d: -f2- | sed 's/^[[:space:]]*//' || true)
   local replay; replay=$(grep -i '^x-idempotent-replay:' "$header_file" 2>/dev/null | tr -d '\r' | awk '{print $2}' | tr '[:upper:]' '[:lower:]' || true)
   HTTP_IDEMPOTENT_REPLAY="${replay:-false}"
   [[ "$HTTP_IDEMPOTENT_REPLAY" == "true" ]] || HTTP_IDEMPOTENT_REPLAY="false"
 
   rm -f "$body_file" "$header_file"
 
-  [[ "${ARK_DEBUG:-0}" -ge 1 ]] && echo "[DEBUG] status=${HTTP_STATUS} body=${HTTP_BODY}" >&2
+  if [[ "${ARK_DEBUG:-0}" -ge 1 ]]; then
+    if [[ "$sensitive" == "true" ]]; then
+      echo "[DEBUG] status=${HTTP_STATUS} request_id=${HTTP_REQUEST_ID} body=[REDACTED]" >&2
+    else
+      echo "[DEBUG] status=${HTTP_STATUS} body=${HTTP_BODY}" >&2
+    fi
+  fi
 
+  return "$exit_code"
+}
+
+http_request() {
+  local method="$1" path="$2" body="${3:-}" idem_key="${4:-}" worker_id="${5:-}" sensitive="${6:-false}"
+  local exit_code=0
+  http_request_once "$method" "$path" "$body" "$idem_key" "$worker_id" "$sensitive" || exit_code=$?
   if [[ $exit_code -ne 0 ]]; then
-    err_json "network_error" "curl failed (exit ${exit_code}): ${url}" "true" "{}" ""
+    err_json "network_error" "curl failed (exit ${exit_code}): $(resolve_api_url)${path}" "true" "{}" ""
     exit 1
   fi
 }
@@ -194,10 +230,10 @@ handle_http_error() {
   esac
 
   jq -n \
-    --arg v "$ARK_VERSION" --arg code "$code" --arg msg "$msg" \
+    --arg v "$ARK_VERSION" --argjson status "$status" --arg code "$code" --arg msg "$msg" \
     --argjson retryable "$retryable" --argjson detail "$detail" \
     --arg suggestion "$suggestion" --arg rid "${HTTP_REQUEST_ID:-}" \
-    '{ok:false,cli_version:$v,error:{code:$code,message:$msg,retryable:$retryable,detail:$detail},suggestion:$suggestion,request_id:$rid}' >&2
+    '{ok:false,cli_version:$v,error:{status:$status,code:$code,message:$msg,retryable:$retryable,detail:$detail},suggestion:$suggestion,request_id:$rid}' >&2
   exit "$exit_code"
 }
 
@@ -251,6 +287,7 @@ http_upload() {
 # ─── upload helpers ────────────────────────────────────────────────────────────
 ARK_MAX_UPLOAD_BYTES="${ARK_MAX_UPLOAD_BYTES:-$((500 * 1024 * 1024))}"
 ARK_UPLOAD_RETRY_ATTEMPTS="${ARK_UPLOAD_RETRY_ATTEMPTS:-3}"
+ARK_MAX_INLINE_JSON_BYTES=$((500 * 1024))
 
 upload_limit_mb() {
   echo $((ARK_MAX_UPLOAD_BYTES / 1024 / 1024))
@@ -387,6 +424,80 @@ append_query_param() {
   else
     printf '%s=%s' "$key" "$encoded"
   fi
+}
+
+resolve_worker_id() {
+  local worker_id="${1:-${ARK_WORKER_ID:-}}"
+  [[ -z "$worker_id" ]] && worker_id=$(config_get "worker-id")
+
+  if [[ -z "$worker_id" ]]; then
+    local host machine_seed fingerprint
+    host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "unknown-host")
+    host=$(printf '%s' "$host" | tr -cs '[:alnum:]_.-' '-')
+    if [[ -r /etc/machine-id ]]; then
+      machine_seed=$(tr -d '[:space:]' </etc/machine-id)
+    elif command -v ioreg &>/dev/null; then
+      machine_seed=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $(NF-1); exit}')
+    else
+      machine_seed="$host"
+    fi
+    fingerprint=$(printf '%s' "$machine_seed" | cksum | awk '{print $1}')
+    worker_id="ark-${host}-${fingerprint}"
+  fi
+
+  worker_id=$(printf '%s' "$worker_id" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [[ -z "$worker_id" || "$worker_id" == *$'\n'* || "$worker_id" == *$'\r'* ]]; then
+    err_json "bad_argument" "ARK_WORKER_ID/worker-id must be a non-empty single-line value" "false" "{}" \
+      "Set ARK_WORKER_ID to the same stable ID used for heartbeats"
+    exit 2
+  fi
+  printf '%s\n' "$worker_id"
+}
+
+retry_after_seconds() {
+  local value="$1"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+
+  local target="" now
+  target=$(date -d "$value" +%s 2>/dev/null \
+    || date -j -f '%a, %d %b %Y %H:%M:%S %Z' "$value" +%s 2>/dev/null \
+    || true)
+  now=$(date +%s)
+  if [[ "$target" =~ ^[0-9]+$ && "$target" -gt "$now" ]]; then
+    printf '%s\n' "$((target - now))"
+  else
+    printf '0\n'
+  fi
+}
+
+retry_delay() {
+  local retry_number="$1" retry_after="${2:-}"
+  if [[ -n "$retry_after" ]]; then
+    local directed; directed=$(retry_after_seconds "$retry_after")
+    if [[ "$directed" -gt 0 || "$retry_after" == "0" ]]; then
+      printf '%s\n' "$directed"
+      return
+    fi
+  fi
+
+  local base="${ARK_SIMILAR_REVIEW_BACKOFF_BASE_SECONDS:-1}"
+  local cap="${ARK_SIMILAR_REVIEW_BACKOFF_MAX_SECONDS:-30}"
+  local jitter_percent="${ARK_SIMILAR_REVIEW_JITTER_PERCENT:-20}"
+  [[ "$base" =~ ^[0-9]+$ ]] || base=1
+  [[ "$cap" =~ ^[0-9]+$ ]] || cap=30
+  [[ "$jitter_percent" =~ ^[0-9]+$ ]] || jitter_percent=20
+
+  local delay=$((base * (2 ** (retry_number - 1))))
+  [[ "$delay" -gt "$cap" ]] && delay="$cap"
+  local spread=$((delay * jitter_percent / 100))
+  if [[ "$spread" -gt 0 ]]; then
+    delay=$((delay + (RANDOM % (2 * spread + 1)) - spread))
+    [[ "$delay" -lt 0 ]] && delay=0
+  fi
+  printf '%s\n' "$delay"
 }
 
 # Resolve a task document's signed URL and stream it to stdout or atomically
@@ -977,15 +1088,20 @@ cmd_tasks_status() {
   local id="${1:-}"; shift || true
   [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" ""; exit 2; }
 
-  local status="" confidence="" comment_id=""
+  local status="" confidence="" comment_id="" run_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)     status="${1#--status=}" ;;
       --status)       shift; status="$1" ;;
       --confidence=*) confidence="${1#--confidence=}" ;;
       --confidence)   shift; confidence="$1" ;;
+      --confidence-score=*) confidence="${1#--confidence-score=}" ;;
+      --confidence-score)   shift; confidence="$1" ;;
       --comment-id=*) comment_id="${1#--comment-id=}" ;;
       --comment-id)   shift; comment_id="$1" ;;
+      --run-id=*)     run_id="${1#--run-id=}" ;;
+      --run-id)       shift; run_id="$1" ;;
+      --json)         force_json_output ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
@@ -994,6 +1110,7 @@ cmd_tasks_status() {
   local body; body=$(jq -n --arg s "$status" '{status:$s}')
   [[ -n "$confidence" ]] && body=$(printf '%s' "$body" | jq --argjson c "$confidence" '. + {confidence_score:$c}')
   [[ -n "$comment_id" ]] && body=$(printf '%s' "$body" | jq --arg cid "$comment_id" '. + {comment_id:$cid}')
+  [[ -n "$run_id" ]]     && body=$(printf '%s' "$body" | jq --arg rid "$run_id" '. + {run_id:$rid}')
 
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}/status" "$body"; return; }
 
@@ -1029,12 +1146,15 @@ cmd_tasks_claim() {
 
 # ─── tasks claim-next / ask-review ─────────────────────────────────────────────
 cmd_tasks_claim_next() {
-  local task_type=""
+  local task_type="" worker_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --task-type=*) task_type="${1#--task-type=}" ;;
       --task-type)   shift; task_type="${1:-}" ;;
-      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks claim-next [--task-type=<type>]"; exit 2 ;;
+      --worker-id=*) worker_override="${1#--worker-id=}" ;;
+      --worker-id)   shift; worker_override="${1:-}" ;;
+      --json)        force_json_output ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks claim-next [--task-type=<type>] [--worker-id=<id>] [--json]"; exit 2 ;;
     esac
     shift || true
   done
@@ -1045,19 +1165,156 @@ cmd_tasks_claim_next() {
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "$endpoint"; return; }
 
   local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
-  http_request "POST" "$endpoint" "" "$ikey"
+  local worker_id; worker_id=$(resolve_worker_id "$worker_override")
+  http_request "POST" "$endpoint" "" "$ikey" "$worker_id"
   [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
   local data links id cmds
   data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
   links=$(printf '%s' "$HTTP_BODY" | jq -c '._links // {}')
-  id=$(printf '%s' "$data" | jq -r '.id // ""')
+  id=$(printf '%s' "$data" | jq -r '.task.id // .id // ""')
   if [[ -n "$id" ]]; then
     cmds=$(next_cmds "$id" "$links")
   else
     cmds="{}"
   fi
   ok_response "$data" "$links" "$cmds"
+}
+
+# ─── tasks similar-reviews list ───────────────────────────────────────────────
+cmd_tasks_similar_reviews_list() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { err_json "bad_argument" "Scan task ID required" "false" "{}" "ark tasks similar-reviews list <scan-task-id> --page-size 100"; exit 2; }
+
+  local page_size="100" after_id="" snapshot_at=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --page-size=*)   page_size="${1#--page-size=}" ;;
+      --page-size)     shift; page_size="${1:-}" ;;
+      --after-id=*)    after_id="${1#--after-id=}" ;;
+      --after-id)      shift; after_id="${1:-}" ;;
+      --snapshot-at=*) snapshot_at="${1#--snapshot-at=}" ;;
+      --snapshot-at)   shift; snapshot_at="${1:-}" ;;
+      --json)          force_json_output ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark tasks similar-reviews list <scan-task-id> --page-size 100 [--after-id <uuid> --snapshot-at <iso>]"; exit 2 ;;
+    esac
+    shift || true
+  done
+
+  [[ "$page_size" =~ ^[0-9]+$ && "$page_size" -ge 1 && "$page_size" -le 100 ]] || {
+    err_json "bad_argument" "--page-size must be an integer between 1 and 100" "false" "{}" ""; exit 2;
+  }
+  if [[ -n "$after_id" && -z "$snapshot_at" ]]; then
+    err_json "bad_argument" "--snapshot-at is required when --after-id is provided" "false" "{}" ""; exit 2
+  fi
+
+  local path="/api/tasks/$(url_encode "$id")/similar-reviews?page_size=$(url_encode "$page_size")"
+  [[ -n "$after_id" ]] && path+="&after_id=$(url_encode "$after_id")"
+  [[ -n "$snapshot_at" ]] && path+="&snapshot_at=$(url_encode "$snapshot_at")"
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "GET" "$path"; return; }
+
+  http_request "GET" "$path" "" "" "" "true"
+  [[ "$HTTP_STATUS" == "200" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+  if ! printf '%s' "$HTTP_BODY" | jq -e '
+    .ok == true and
+    ((.data | type) == "array") and
+    ((.meta | type) == "object") and
+    ((.meta.scanned | type) == "number") and
+    ((.meta.matched | type) == "number") and
+    ((.meta.has_more | type) == "boolean") and
+    ((.meta.snapshot_at | type) == "string") and
+    (.meta.has_more == false or ((.meta.next_after_id | type) == "string")) and
+    all(.data[]; .request.method == "POST" and ((.request.href | type) == "string") and ((.request.body | type) == "object"))' &>/dev/null; then
+    err_json "invalid_response" "similar-reviews returned an invalid pagination contract" "false" \
+      "$(jq -n --arg rid "${HTTP_REQUEST_ID:-}" '{request_id:$rid}')" ""; exit 1
+  fi
+
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data')
+  meta=$(printf '%s' "$HTTP_BODY" | jq -c '.meta')
+  ok_response "$data" "{}" "{}" "$meta"
+}
+
+# ─── SOAT direct similar review ───────────────────────────────────────────────
+cmd_soat_corrections_similar_review() {
+  local case_id="${1:-}"; shift || true
+  [[ -z "$case_id" ]] && { err_json "bad_argument" "Case ID required" "false" "{}" "ark soat corrections similar-review <case-id> --scan-task-id <id> --item-key <key> --baseline-output-id <id>"; exit 2; }
+
+  local scan_task_id="" item_key="" baseline_output_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scan-task-id=*)       scan_task_id="${1#--scan-task-id=}" ;;
+      --scan-task-id)         shift; scan_task_id="${1:-}" ;;
+      --item-key=*)           item_key="${1#--item-key=}" ;;
+      --item-key)             shift; item_key="${1:-}" ;;
+      --baseline-output-id=*) baseline_output_id="${1#--baseline-output-id=}" ;;
+      --baseline-output-id)   shift; baseline_output_id="${1:-}" ;;
+      --json)                 force_json_output ;;
+      *) err_json "bad_argument" "Unknown: $1" "false" "{}" "ark soat corrections similar-review <case-id> --scan-task-id <id> --item-key <key> --baseline-output-id <id>"; exit 2 ;;
+    esac
+    shift || true
+  done
+  [[ -n "$scan_task_id" && -n "$item_key" && -n "$baseline_output_id" ]] || {
+    err_json "bad_argument" "--scan-task-id, --item-key and --baseline-output-id are required" "false" "{}" ""; exit 2;
+  }
+
+  local body path
+  body=$(jq -n --arg scan "$scan_task_id" --arg item "$item_key" --arg baseline "$baseline_output_id" \
+    '{scan_task_id:$scan,item_key:$item,baseline_output_id:$baseline}')
+  path="/api/soat/$(url_encode "$case_id")/corrections/similar-review"
+  [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "$path" "$body"; return; }
+
+  local max_retries="${ARK_SIMILAR_REVIEW_MAX_RETRIES:-3}"
+  [[ "$max_retries" =~ ^[0-9]+$ ]] || {
+    err_json "bad_argument" "ARK_SIMILAR_REVIEW_MAX_RETRIES must be a non-negative integer" "false" "{}" ""; exit 2;
+  }
+
+  local retries=0 curl_exit=0 delay=""
+  while true; do
+    curl_exit=0
+    http_request_once "POST" "$path" "$body" "" "" "true" || curl_exit=$?
+    if [[ "$curl_exit" -ne 0 ]]; then
+      if [[ "$retries" -ge "$max_retries" ]]; then
+        local detail
+        detail=$(jq -n --argjson attempts "$((retries + 1))" --argjson curl_exit "$curl_exit" '{attempts:$attempts,curl_exit:$curl_exit}')
+        err_json_status 503 "network_error" "Direct similar review failed without an HTTP response" "true" "$detail" "Retry the target later"
+        exit 1
+      fi
+      retries=$((retries + 1))
+      delay=$(retry_delay "$retries")
+      echo "[similar-review] retry=${retries} reason=network delay=${delay}s" >&2
+      sleep "$delay"
+      continue
+    fi
+
+    case "$HTTP_STATUS" in
+      200) break ;;
+      429|5[0-9][0-9])
+        if [[ "$retries" -ge "$max_retries" ]]; then
+          handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
+        fi
+        retries=$((retries + 1))
+        delay=$(retry_delay "$retries" "$HTTP_RETRY_AFTER")
+        echo "[similar-review] retry=${retries} status=${HTTP_STATUS} delay=${delay}s" >&2
+        sleep "$delay"
+        ;;
+      *) handle_http_error "$HTTP_STATUS" "$HTTP_BODY" ;;
+    esac
+  done
+
+  if ! printf '%s' "$HTTP_BODY" | jq -e '
+    .ok == true and ((.data | type) == "object") and
+    (.data.decision == "proposal" or .data.decision == "abstain") and
+    ((.data.explanation | type) == "string") and ((.data.changed_paths | type) == "array") and
+    ((.data.target | type) == "object") and ((.data.model | type) == "object") and
+    (if .data.decision == "proposal" then ((.data.proposal | type) == "object") else .data.proposal == null end)' &>/dev/null; then
+    err_json "invalid_response" "similar-review returned an invalid result contract" "false" \
+      "$(jq -n --arg rid "${HTTP_REQUEST_ID:-}" '{request_id:$rid}')" ""; exit 1
+  fi
+
+  local data
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data')
+  ok_response "$data" "{}" "{}"
 }
 
 cmd_tasks_ask_review() {
@@ -1890,23 +2147,47 @@ cmd_tasks_outputs_submit() {
   local id="${1:-}"; shift || true
   [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks outputs submit <id> --type <type> --label <label>"; exit 2; }
 
-  local otype="" label="" data_json="" storage_path="" size_bytes=""
+  local otype="" label="" data_json="" data_file="" storage_path="" size_bytes="" run_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)         otype="${1#--type=}" ;;
       --type)           shift; otype="$1" ;;
+      --output-type=*)  otype="${1#--output-type=}" ;;
+      --output-type)    shift; otype="$1" ;;
       --label=*)        label="${1#--label=}" ;;
       --label)          shift; label="$1" ;;
       --data=*)         data_json="${1#--data=}" ;;
       --data)           shift; data_json="$1" ;;
+      --data-file=*)    data_file="${1#--data-file=}" ;;
+      --data-file)      shift; data_file="$1" ;;
       --storage-path=*) storage_path="${1#--storage-path=}" ;;
       --storage-path)   shift; storage_path="$1" ;;
       --size=*)         size_bytes="${1#--size=}" ;;
       --size)           shift; size_bytes="$1" ;;
+      --run-id=*)       run_id="${1#--run-id=}" ;;
+      --run-id)         shift; run_id="$1" ;;
+      --json)           force_json_output ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
   [[ -z "$otype" || -z "$label" ]] && { err_json "bad_argument" "--type and --label are required" "false" "{}" "ark tasks outputs submit ${id} --type <type> --label <label>"; exit 2; }
+  if [[ -n "$data_json" && -n "$data_file" ]]; then
+    err_json "bad_argument" "--data and --data-file are mutually exclusive" "false" "{}" ""; exit 2
+  fi
+  if [[ -n "$data_file" ]]; then
+    [[ -f "$data_file" ]] || { err_json "bad_argument" "File not found: ${data_file}" "false" "{}" ""; exit 2; }
+    if ! data_json=$(jq -c '.' "$data_file" 2>/dev/null); then
+      err_json "bad_argument" "--data-file must contain valid JSON" "false" "{}" ""; exit 2
+    fi
+    local inline_bytes
+    inline_bytes=$(LC_ALL=C printf '%s' "$data_json" | wc -c | tr -d '[:space:]')
+    if [[ "$inline_bytes" -ge "$ARK_MAX_INLINE_JSON_BYTES" ]]; then
+      err_json "payload_too_large" "Inline JSON report must be smaller than 500 KiB" "false" \
+        "$(jq -n --argjson sz "$inline_bytes" --argjson max "$ARK_MAX_INLINE_JSON_BYTES" --arg file "$data_file" '{size_bytes:$sz,max_bytes_exclusive:$max,data_file:$file}')" \
+        "Keep the local file; do not truncate or complete the task"
+      exit 2
+    fi
+  fi
 
   local body; body=$(jq -n --arg t "$otype" --arg l "$label" '{output_type:$t,label:$l}')
 
@@ -1916,15 +2197,20 @@ cmd_tasks_outputs_submit() {
   fi
   [[ -n "$storage_path" ]] && body=$(printf '%s' "$body" | jq --arg sp "$storage_path" '. + {storage_path:$sp}')
   [[ -n "$size_bytes" ]]   && body=$(printf '%s' "$body" | jq --argjson sz "$size_bytes" '. + {size_bytes:$sz}')
+  [[ -n "$run_id" ]]       && body=$(printf '%s' "$body" | jq --arg rid "$run_id" '. + {run_id:$rid}')
 
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/outputs" "$body"; return; }
 
   local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
-  http_request "POST" "/api/tasks/${id}/outputs" "$body" "$ikey"
+  local sensitive="false"
+  [[ "$label" == "report" ]] && sensitive="true"
+  http_request "POST" "/api/tasks/${id}/outputs" "$body" "$ikey" "" "$sensitive"
   [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
 
-  local data; data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
-  ok_response "$data" "{}" "{}"
+  local data meta
+  data=$(printf '%s' "$HTTP_BODY" | jq -c '.data // {}')
+  meta=$(jq -n --argjson status "$HTTP_STATUS" '{http_status:$status}')
+  ok_response "$data" "{}" "{}" "$meta"
 }
 
 # ─── tasks outputs upload ──────────────────────────────────────────────────────
@@ -2676,6 +2962,21 @@ cmd_skills() {
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
           "ark tasks complete \"$TASK_ID\" --confidence 0.92"
         ],
+        similar_review_scan: [
+          "# Applies only when task.context.type == soat_similar_review_scan",
+          "TASK_ID=$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \u0027.data.task.id // .data.id\u0027)",
+          "RUN_ID=$(printf \u0027%s\u0027 \"$CLAIM\" | jq -r \u0027.data.task.run_id // .data.run_id\u0027)",
+          "PAGE=$(ark tasks similar-reviews list \"$TASK_ID\" --page-size 100 --json)",
+          "# Follow meta.next_after_id + meta.snapshot_at until meta.has_more=false",
+          "# Execute returned requests with at most 8 concurrent processes; preserve every data object",
+          "# Validate scanned/matched counters, result length, and unique targets with jq",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
+          "ark tasks outputs create \"$TASK_ID\" --output-type json --label report --run-id \"$RUN_ID\" --data-file report.json --json",
+          "# Confirm meta.http_status == 201 before completing",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
+          "ark tasks status \"$TASK_ID\" --status done --confidence-score 1 --run-id \"$RUN_ID\" --json",
+          "# Never call ask-review, review/decision, corrections/apply, create review tasks, or publish proposals"
+        ],
         create_followon_task: [
           "ark tasks create --title \"Follow-on work\" --status queued --context \"{}\""
         ],
@@ -2825,6 +3126,11 @@ cmd_skills() {
         ARK_FORMAT:          "json | human (default: json)",
         ARK_DEBUG:           "0 | 1 | 2 (default: 0)",
         ARK_IDEMPOTENCY_KEY: "Reuse to retry a failed action with same key",
+        ARK_WORKER_ID:       "Stable machine identity sent as X-Worker-Id on claim-next",
+        ARK_SIMILAR_REVIEW_MAX_RETRIES: "Transient direct-review retries after the first attempt (default: 3)",
+        ARK_SIMILAR_REVIEW_BACKOFF_BASE_SECONDS: "Initial direct-review retry delay (default: 1)",
+        ARK_SIMILAR_REVIEW_BACKOFF_MAX_SECONDS: "Direct-review retry delay cap (default: 30)",
+        ARK_SIMILAR_REVIEW_JITTER_PERCENT: "Direct-review backoff jitter percentage (default: 20)",
         ARK_CONFIG_FILE:     "Override the config file path (useful for isolated automation/tests)",
         ARK_SHARE_DIR:       "Override shared data directory",
         ARK_SCRIPTS_DIR:     "Override audit scripts directory (default: <share-dir>/scripts)",
@@ -2861,7 +3167,17 @@ cmd_skills() {
       },
       upload_limits: {
         max_file_bytes: 524288000,
+        max_inline_json_bytes_exclusive: 512000,
         note: "500 MB per file by default, matching the task-documents bucket limit. Override ARK_MAX_UPLOAD_BYTES only if the API/bucket limit changes."
+      },
+      similar_review: {
+        discovery: "ark tasks similar-reviews list <scan-task-id> --page-size 100 [--after-id] [--snapshot-at] --json",
+        review: "ark soat corrections similar-review <case-id> --scan-task-id <id> --item-key <key> --baseline-output-id <id> --json",
+        concurrency_max: 8,
+        transient_retries: ["network","429","5xx"],
+        permanent_failures: ["other 4xx"],
+        completion_order: ["persist report and confirm 201","status done with run_id"],
+        forbidden: ["ask-review","review/decision","corrections/apply","review tasks","automatic proposal publication"]
       },
       confidence_routing: {
         ">=0.85": "transitions to done — no human review needed",
@@ -2883,6 +3199,13 @@ cmd_skills() {
         idempotent_replay:"boolean — true when response came from idempotency cache",
         request_id:       "uuid for log correlation with API",
         meta:             "(list responses only) count for this page and next_cursor; use ark tasks stats for totals"
+      },
+      error_envelope: {
+        status:           "numeric HTTP status; synthetic 503 when direct-review network retries are exhausted",
+        code:             "stable API or CLI error code",
+        message:          "human-readable error message",
+        retryable:        "whether retrying the same logical action may succeed",
+        detail:           "structured API or CLI error context"
       },
       task_types: {
         "general":             "Razona y ejecuta con instrucciones en context. Usar workflow execute_queued_task.",
@@ -3045,11 +3368,13 @@ TASKS
   ark tasks context-set <id>         Merge fields into context without replacing it (agent only)
     --set key=value  [--set key2=value2 ...]
   ark tasks status <id>              Transition status manually
-    --status=<status>  [--confidence=]  [--comment-id=]
+    --status=<status>  [--confidence=|--confidence-score=]  [--comment-id=]  [--run-id=]  [--json]
     release hold with --status=draft
   ark tasks claim <id>               Transition queued → in_progress
   ark tasks claim-next               Atomically claim the next eligible queued task
-    [--task-type=<type>]
+    [--task-type=<type>]  [--worker-id=<stable-worker-id>]  [--json]
+  ark tasks similar-reviews list <scan-task-id>
+    [--page-size=100]  [--after-id=<uuid>]  [--snapshot-at=<iso-date-time>]  [--json]
   ark tasks ask-review <id>          Request human review without completing the task
     [--reason=<reason>]
   ark tasks complete <id>            Transition to done (>=0.85) or review (<0.85)
@@ -3110,7 +3435,8 @@ OUTPUTS
     Defaults to the highest report version; streams raw bytes to stdout without -o
   ark tasks outputs submit <id>      Submit an inline or pre-staged deliverable (agent only)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
-    [--data=<json>]  [--storage-path=]  [--size=<bytes>]
+    [--data=<json>|--data-file=<path>]  [--storage-path=]  [--size=<bytes>]  [--run-id=]  [--json]
+  ark tasks outputs create <id>      Alias of outputs submit; also accepts --output-type
   ark tasks outputs upload <id> <file-path>   Upload a file deliverable (agent only, ≤ 500 MB)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
     [--local-path=]
@@ -3119,6 +3445,11 @@ OUTPUTS
 DOCUMENTS
   ark tasks documents url <id> <input|output> <record-id>
                                      Get a short-lived (~1h) signed URL for a stored file
+
+SOAT
+  ark soat corrections similar-review <case-id>
+    --scan-task-id=<id>  --item-key=<key>  --baseline-output-id=<id>  [--json]
+                                     Run one read-only direct review with transient retries
 
 AUDIT
   ark audit <operacion> [arg]        Run a deterministic audit script
@@ -3169,6 +3500,7 @@ UTILITY
 
 GLOBAL FLAGS
   --human      Human-readable output instead of JSON
+  --json       Force JSON output even when human output is configured
   --dry-run    Print request without sending it
 
 ENVIRONMENT
@@ -3176,6 +3508,11 @@ ENVIRONMENT
   ARK_FORMAT           json | human
   ARK_DEBUG            0 | 1 | 2  (2 = print full request + response)
   ARK_IDEMPOTENCY_KEY  Reuse this key on retry to get idempotent response
+  ARK_WORKER_ID         Stable machine ID sent as X-Worker-Id on claim-next
+  ARK_SIMILAR_REVIEW_MAX_RETRIES  Direct-review retries after the first attempt (default: 3)
+  ARK_SIMILAR_REVIEW_BACKOFF_BASE_SECONDS  Initial retry delay (default: 1)
+  ARK_SIMILAR_REVIEW_BACKOFF_MAX_SECONDS   Retry delay cap (default: 30)
+  ARK_SIMILAR_REVIEW_JITTER_PERCENT        Backoff jitter percentage (default: 20)
   ARK_CONFIG_FILE      Override the config file path
   ARK_SHARE_DIR        Override shared data directory
   ARK_SCRIPTS_DIR      Override scripts directory (default: <share-dir>/scripts)
@@ -3201,6 +3538,7 @@ main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --human)   HUMAN_OUTPUT=true; shift ;;
+      --json)    force_json_output; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --)        shift; break ;;
       *)         break ;;
@@ -3225,6 +3563,12 @@ main() {
         status)       cmd_tasks_status "$@" ;;
         claim)      cmd_tasks_claim "$@" ;;
         claim-next) cmd_tasks_claim_next "$@" ;;
+        similar-reviews)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            list) cmd_tasks_similar_reviews_list "$@" ;;
+            *) err_json "bad_argument" "Unknown similar-reviews subcommand: ${sub2}" "false" "{}" "ark tasks similar-reviews list <scan-task-id>"; exit 2 ;;
+          esac ;;
         ask-review) cmd_tasks_ask_review "$@" ;;
         complete) cmd_tasks_complete "$@" ;;
         block)    cmd_tasks_block "$@" ;;
@@ -3256,7 +3600,7 @@ main() {
           local sub2="${1:-}"; shift || true
           case "$sub2" in
             list)   cmd_tasks_outputs_list "$@" ;;
-            submit) cmd_tasks_outputs_submit "$@" ;;
+            submit|create) cmd_tasks_outputs_submit "$@" ;;
             upload) cmd_tasks_outputs_upload "$@" ;;
             download) cmd_tasks_outputs_download "$@" ;;
             get)    cmd_tasks_outputs_get "$@" ;;
@@ -3264,6 +3608,17 @@ main() {
           esac ;;
         documents) cmd_tasks_documents_url "$@" ;;
         *) err_json "bad_argument" "Unknown tasks subcommand: ${sub}" "false" "{}" "ark help"; exit 2 ;;
+      esac ;;
+    soat)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        corrections)
+          local sub2="${1:-}"; shift || true
+          case "$sub2" in
+            similar-review) cmd_soat_corrections_similar_review "$@" ;;
+            *) err_json "bad_argument" "Unknown corrections subcommand: ${sub2}" "false" "{}" "ark soat corrections similar-review <case-id>"; exit 2 ;;
+          esac ;;
+        *) err_json "bad_argument" "Unknown soat subcommand: ${sub}" "false" "{}" "ark soat corrections similar-review <case-id>"; exit 2 ;;
       esac ;;
     batches)
       local sub="${1:-}"; shift || true
