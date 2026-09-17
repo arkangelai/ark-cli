@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## Unreleased
+## [0.6.1] — 2026-09-17
 
 ### Changed (breaking)
 - `ark tasks claim-next` no longer accepts task-selection filters. It accepts
