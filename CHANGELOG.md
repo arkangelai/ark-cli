@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.6.3] — 2026-09-17
+
+### Added
+- `ark tasks outputs submit` and `ark tasks outputs upload` accept
+  `--grounding <json|@file|->` and `--grounding-contract-version <int>`, so a
+  worker can finally attest the provenance of a SOAT report: which OCR document
+  it adjudicated and which pages it read (salmona-api#1128, #782). Until now the
+  CLI had no way to send the block, so every `audit_soat` task failed the
+  server's coverage gate and ended blocked or in review.
+
+  Payload shape:
+
+  ```json
+  {"documents":[{"input_id":"<uuid>","ocr_sha256":"<sha>","pages_read":"1-93","pages_cited":[12,40]}]}
+  ```
+
+  Pages are 1-based within each document and `pages_cited` must be a subset of
+  `pages_read`. The value may be inline JSON, `@path/to/file.json`, or `-` to
+  read it from stdin.
+
+  Wire contracts match the API spec: on the JSON endpoint `grounding` is a JSON
+  object in the body; on the multipart endpoint it is a JSON-encoded string form
+  field. `grounding_contract_version` is an integer on both. Dry-run shows what
+  would be sent.
+
+  The CLI validates only that the value parses as JSON. The server owns the
+  grounding schema and the page count it is checked against, and rejects a block
+  it does not accept with `422`. Invalid JSON fails locally with `bad_argument`
+  (exit 2) and sends no request.
+
+- `ark skills` exposes an `upload_soat_report` workflow and documents the
+  `grounding` / `grounding_contract_version` output fields.
+
 ## [0.6.2] — 2026-09-17
 
 ### Fixed

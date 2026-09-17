@@ -55,7 +55,7 @@ Every successful command outputs this shape to stdout:
 ```json
 {
   "ok": true,
-  "cli_version": "0.6.2",
+  "cli_version": "0.6.3",
   "data": { },
   "_links": { },
   "next_commands": {
@@ -82,7 +82,7 @@ Error envelope goes to **stderr**:
 ```json
 {
   "ok": false,
-  "cli_version": "0.6.2",
+  "cli_version": "0.6.3",
   "error": {
     "status": 409,
     "code": "invalid_status_transition",
@@ -131,6 +131,7 @@ export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
 ark tasks update "$TASK_ID" --log-path "storage://tasks/${TASK_ID}/workspace/"
 
 # Upload the final output (format determined by task context)
+# SOAT reports must also carry --grounding; see the "SOAT Grounding" section.
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
 ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext --type file --label report
 
@@ -198,6 +199,55 @@ not sent.
 
 ---
 
+## SOAT Grounding (`--grounding`)
+
+A SOAT report output carries a provenance block saying which OCR document was
+adjudicated and which pages were read. Both `ark tasks outputs submit` and
+`ark tasks outputs upload` accept it:
+
+```
+--grounding <json | @path/to/file.json | ->      # - reads the block from stdin
+--grounding-contract-version 1                    # optional, integer
+```
+
+Payload shape:
+
+```json
+{"documents":[{"input_id":"<uuid>","ocr_sha256":"<sha>","pages_read":"1-93","pages_cited":[12,40]}]}
+```
+
+- `input_id` is a task input of this task; read it from
+  `ark tasks inputs list <id>`.
+- `ocr_sha256` is the `ocr_sha256` of that same input; read it from
+  `ark tasks inputs ocr <id> <input-id>`.
+- `pages_read` is a compact 1-based page range **within that document**:
+  `"1-19,45,60-72"`.
+- `pages_cited` is the list of pages cited as evidence, also 1-based within the
+  document, and must be a subset of `pages_read`.
+- Use one entry per OCR document when the folio spans several.
+
+This is an **attestation**, not proof of reading: the server checks it against
+the case's real page count (which it owns, from the OCR inputs), writes
+`pages_total`, `pages_read_count` and `coverage_complete` on the output row, and
+answers `422` when the block does not hold. The CLI validates only that the
+value parses as JSON; on invalid JSON it fails locally with `bad_argument`
+(exit 2) and sends no request.
+
+```bash
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
+ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.json \
+  --type file --label report \
+  --grounding "@/tmp/grounding-${TASK_ID}.json" \
+  --grounding-contract-version 1
+```
+
+Wire format differs by endpoint, and the CLI handles it: on the JSON endpoint
+(`submit`) `grounding` is a JSON **object** in the body; on the multipart
+endpoint (`upload`) it is a JSON-encoded **string** form field.
+`grounding_contract_version` is an integer on both.
+
+---
+
 ## Commands Available to the Agent
 
 Use these to read and mutate task state:
@@ -215,8 +265,8 @@ Use these to read and mutate task state:
 | `ark tasks status <id> --status draft` | Release a held task into draft/OCR |
 | `ark tasks update <id> --log-path` | Set workspace storage path |
 | `ark tasks context-set <id> --set key=value` | **Merge fields into context** (preserves existing fields) |
-| `ark tasks outputs upload <id>` | Push output file and record it |
-| `ark tasks outputs submit/create <id>` | Register already-staged or inline output; `create` supports issue-compatible aliases |
+| `ark tasks outputs upload <id>` | Push output file and record it; `--grounding` on SOAT reports |
+| `ark tasks outputs submit/create <id>` | Register already-staged or inline output; `create` supports issue-compatible aliases; `--grounding` on SOAT reports |
 | `ark soat corrections similar-review <case-id>` | Run one read-only direct review with bounded transient retries |
 | `ark tasks outputs download <id> [--label report] [--version N] [-o file]` | Download the latest matching output; defaults to the latest report and stdout |
 | `ark tasks complete <id>` | Transition to done (human review is decided server-side) |
