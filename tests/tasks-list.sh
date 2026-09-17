@@ -56,7 +56,7 @@ cmd_tasks_list \
 
 output=$(<"$tmp_output")
 assert_eq "GET" "$CAPTURED_METHOD" "list uses GET"
-assert_eq "/api/tasks?limit=100&status=blocked&priority=high&cursor=opaque%2Bcursor%2Fvalue&created_after=2026-08-01T00%3A00%3A00-05%3A00&created_before=2026-08-10&sort=created_at&order=asc&fields=id%2Cstatus%2Ctitle%2Ccreated_at" "$CAPTURED_PATH" "all query controls are forwarded and encoded"
+assert_eq "/api/tasks?limit=100&status=blocked&priority=high&cursor=opaque%2Bcursor%2Fvalue&since=2026-08-01T00%3A00%3A00-05%3A00&until=2026-08-10&sort=created_at&order=asc&fields=id%2Cstatus%2Ctitle%2Ccreated_at" "$CAPTURED_PATH" "all query controls are forwarded and encoded"
 assert_json_eq 'true' '.ok' "$output" "success envelope is preserved"
 assert_json_eq '1' '.meta.count' "$output" "list metadata is preserved"
 assert_json_eq '"Oldest blocker"' '.data[0].title' "$output" "task data is preserved"

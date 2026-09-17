@@ -105,9 +105,9 @@ test_list_all_follows_cursor() {
       HTTP_STATUS="200"
       HTTP_REQUEST_ID="request-list-${request_number}"
       HTTP_IDEMPOTENT_REPLAY="false"
-      if [[ "$2" == "/api/tasks?limit=100&status=review&factura_key=FE%2057100&created_after=2026-08-01T00%3A00%3A00%2B00%3A00&sort=created_at&order=asc&fields=id%2Cstatus%2Ctitle%2Ccreated_at" ]]; then
+      if [[ "$2" == "/api/tasks?limit=100&status=review&factura_key=FE%2057100&since=2026-08-01T00%3A00%3A00%2B00%3A00&sort=created_at&order=asc&fields=id%2Cstatus%2Ctitle%2Ccreated_at" ]]; then
         HTTP_BODY='{"ok":true,"data":[{"id":"one"},{"id":"two"}],"meta":{"count":2,"next_cursor":"cursor+2:next"}}'
-      elif [[ "$2" == "/api/tasks?limit=100&status=review&factura_key=FE%2057100&cursor=cursor%2B2%3Anext&created_after=2026-08-01T00%3A00%3A00%2B00%3A00&sort=created_at&order=asc&fields=id%2Cstatus%2Ctitle%2Ccreated_at" ]]; then
+      elif [[ "$2" == "/api/tasks?limit=100&status=review&factura_key=FE%2057100&cursor=cursor%2B2%3Anext&since=2026-08-01T00%3A00%3A00%2B00%3A00&sort=created_at&order=asc&fields=id%2Cstatus%2Ctitle%2Ccreated_at" ]]; then
         HTTP_BODY='{"ok":true,"data":[{"id":"three"}],"meta":{"count":1,"next_cursor":null}}'
       else
         return 1

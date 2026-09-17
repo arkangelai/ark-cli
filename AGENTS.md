@@ -55,7 +55,7 @@ Every successful command outputs this shape to stdout:
 ```json
 {
   "ok": true,
-  "cli_version": "0.6.1",
+  "cli_version": "0.6.2",
   "data": { },
   "_links": { },
   "next_commands": {
@@ -82,7 +82,7 @@ Error envelope goes to **stderr**:
 ```json
 {
   "ok": false,
-  "cli_version": "0.6.1",
+  "cli_version": "0.6.2",
   "error": {
     "status": 409,
     "code": "invalid_status_transition",
