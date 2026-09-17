@@ -180,7 +180,7 @@ test_literal_aliases_and_run_fencing() (
 
   output=$(main tasks status task-1 --status done --confidence-score 1 --run-id run-1 --json)
   assert_jq "$output" '.data.status == "done"'
-  assert_jq "$(<"$request_body")" '.status == "done" and .confidence_score == 1 and .run_id == "run-1"'
+  assert_jq "$(<"$request_body")" '.status == "done" and .run_id == "run-1" and (has("confidence_score") | not)'
 )
 
 test_data_file_validation_and_limit() (

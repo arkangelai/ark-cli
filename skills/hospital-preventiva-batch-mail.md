@@ -150,7 +150,7 @@ Si algún `context-set` individual falla, registrarlo como comentario `note` en 
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence 1.0
+ark tasks complete "$TASK_ID"
 ```
 
 **Si exit code `1` (error recuperable):**
@@ -248,7 +248,7 @@ Arkangel AI"
   fi
 
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-  ark tasks complete "$TASK_ID" --confidence 1.0
+  ark tasks complete "$TASK_ID"
 
 else
   EXIT_CODE=$?

@@ -20,7 +20,7 @@ ark skills
 
 ## Capability Discovery
 
-Run `ark skills` at cold-start to get the full capability map: workflows, exit codes, env vars, idempotency strategy, and confidence routing — all as JSON.
+Run `ark skills` at cold-start to get the full capability map: workflows, exit codes, env vars, idempotency strategy, and completion semantics — all as JSON.
 
 ---
 
@@ -60,7 +60,7 @@ Every successful command outputs this shape to stdout:
   "_links": { },
   "next_commands": {
     "claim":    "ark tasks claim <id>",
-    "complete": "ark tasks complete <id> --confidence <0.0-1.0>",
+    "complete": "ark tasks complete <id>",
     "block":    "ark tasks block <id> --reason \"<reason>\""
   },
   "idempotent_replay": false,
@@ -138,9 +138,9 @@ ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext --type file --lab
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:context-set"
 ark tasks context-set "$TASK_ID" --set email_sent=true --set sent_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# Complete with the same confidence score
+# Complete the task
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence 0.92
+ark tasks complete "$TASK_ID"
 ```
 
 On retry: set `ARK_IDEMPOTENCY_KEY` to the same key used in the first attempt before rerunning the command. The API returns the cached response without re-executing. `idempotent_replay: true` in the response confirms this.
@@ -170,13 +170,19 @@ ark tasks comments list "$TASK_ID" | jq '.data[] | select(.label == "blocker")'
 
 ---
 
-## Confidence Routing
+## Completion and Human Review
 
-`ark tasks complete` routes automatically:
-- `--confidence >= 0.85` → transitions to `done` (no human review)
-- `--confidence < 0.85` → transitions to `review` (awaits human)
+`ark tasks complete <id>` always requests `done`. Agents do not choose between
+`done` and `review`: server-side gates decide whether a task needs human review
+and may land it in `review`.
 
-Score honestly. Do not optimistically inflate confidence.
+If a human must check something before the output can be used, do not complete.
+Post a `blocker` comment explaining what must be checked and move the task to
+`blocked` with `ark tasks block <id> --reason "..."`.
+
+`--confidence` (on `complete`) and `--confidence`/`--confidence-score` (on
+`status`) are deprecated no-ops kept for existing callers; they are ignored and
+not sent.
 
 ---
 
@@ -201,7 +207,7 @@ Use these to read and mutate task state:
 | `ark tasks outputs submit/create <id>` | Register already-staged or inline output; `create` supports issue-compatible aliases |
 | `ark soat corrections similar-review <case-id>` | Run one read-only direct review with bounded transient retries |
 | `ark tasks outputs download <id> [--label report] [--version N] [-o file]` | Download the latest matching output; defaults to the latest report and stdout |
-| `ark tasks complete <id> --confidence` | Transition to done or review |
+| `ark tasks complete <id>` | Transition to done (human review is decided server-side) |
 | `ark tasks block <id> --reason` | Signal blocker, transition to blocked |
 | `ark tasks comments post <id>` | Post a note or blocker comment |
 | `ark tasks inputs list <id>` | List task inputs |
@@ -264,11 +270,10 @@ DESCRIPTION=$(echo "$TASK" | jq -r '.data.description')
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note"
 ark tasks comments post "$TASK_ID" --label note --body "Completed analysis. Writing report."
 
-# Determine confidence and post rationale as a comment
-CONFIDENCE=0.92
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
+# Post verification notes as a comment
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:verification"
 ark tasks comments post "$TASK_ID" --label note \
-  --body "Confidence ${CONFIDENCE}: Verified findings against source data; no unresolved edge cases."
+  --body "Verified findings against source data; no unresolved edge cases."
 
 # Write the final output in the format the task context requires
 
@@ -276,9 +281,9 @@ ark tasks comments post "$TASK_ID" --label note \
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
 ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext --type file --label report
 
-# Complete with the same confidence
+# Complete the task
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
+ark tasks complete "$TASK_ID"
 ```
 
 ### Workflow 2 — Create a Follow-on Task
@@ -345,11 +350,10 @@ LOG_PATH=$(echo "$TASK" | jq -r '.data.log_path')
 
 # ... apply changes, produce new output ...
 
-# Re-determine confidence and post rationale as a comment
-CONFIDENCE=0.90
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
+# Post fresh verification notes as a comment
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:verification"
 ark tasks comments post "$TASK_ID" --label note \
-  --body "Confidence ${CONFIDENCE}: Addressed human feedback; <what changed and why>."
+  --body "Addressed human feedback; <what changed and why>."
 
 # Write the revised output in the format the task context requires
 
@@ -357,7 +361,7 @@ export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
 ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext --type file --label report
 
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
+ark tasks complete "$TASK_ID"
 ```
 
 ### Workflow 6 — Learnings (list, download, upload)
@@ -449,7 +453,7 @@ if ark audit send-denial-mail "$TASK_ID" 2>"$STDERR_FILE"; then
   fi
 
   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-  ark tasks complete "$TASK_ID" --confidence 1.0
+  ark tasks complete "$TASK_ID"
 else
   EXIT_CODE=$?
   STDERR_CONTENT=$(cat "$STDERR_FILE")
@@ -489,8 +493,7 @@ ark tasks outputs create "$TASK_ID" --output-type json --label report \
 
 # Continue only after meta.http_status == 201.
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks status "$TASK_ID" --status done --confidence-score 1 \
-  --run-id "$RUN_ID" --json
+ark tasks status "$TASK_ID" --status done --run-id "$RUN_ID" --json
 ```
 
 Do not complete when the report reaches 500 KiB. On `409 stale_execution`,
@@ -512,7 +515,7 @@ Cuando `ark audit send-denial-mail` falla:
 
 | Exit code | Acción del agente |
 |---|---|
-| `0` | Actualizar tareas `eps_audit` con `reply_sent`, luego `ark tasks complete <id> --confidence 1.0` |
+| `0` | Actualizar tareas `eps_audit` con `reply_sent`, luego `ark tasks complete <id>` |
 | `1` | Postear stderr como `note` · `ark tasks block <id> --reason "..."` |
 | `2` | Postear stderr como `note` · `ark tasks block <id> --reason "argumento inválido o tarea no encontrada"` |
 

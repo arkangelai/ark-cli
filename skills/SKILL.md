@@ -3,10 +3,10 @@ name: tasks-ark-execution
 description: >
   Execute tasks from a task queue using the Tasks Ark CLI (ark). Covers the full
   agent lifecycle: claiming a queued task, reading inputs, doing work, submitting
-  outputs, and completing with a confidence score. Also handles blockers,
+  outputs, and completing the task. Also handles blockers,
   follow-on task creation, and re-execution after human feedback. Use when you
   are an agent that needs to pick up and execute tasks from the queue.
-version: "1.6"
+version: "1.7"
 compatibility: Requires ark CLI installed and configured with a valid api-key and url.
 ---
 
@@ -19,7 +19,7 @@ that a human reviewer can understand exactly what you did and why.
 Each task has a clear lifecycle. Before agent work, a human may park it in
 `hold` (no OCR, no AI), release it to `draft` (OCR may run, AI frozen), and move
 it to `queued` when it is ready for an agent. Agents then claim it, do the work,
-submit outputs, and close it with an honest confidence score. The API enforces
+submit outputs, and close it as `done`. The API enforces
 every transition; you cannot skip steps or take shortcuts. Follow `next_commands`
 from each response — it tells you exactly what is valid next.
 
@@ -100,8 +100,7 @@ ark tasks outputs create "$TASK_ID" --output-type json --label report \
 
 # Continue only after meta.http_status == 201.
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks status "$TASK_ID" --status done --confidence-score 1 \
-  --run-id "$RUN_ID" --json
+ark tasks status "$TASK_ID" --status done --run-id "$RUN_ID" --json
 ```
 
 Do not complete if the report reaches 500 KiB. On `409 stale_execution`,
@@ -155,7 +154,7 @@ Si el PATCH de alguna tarea individual falla, registrarlo como comentario `note`
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence 1.0
+ark tasks complete "$TASK_ID"
 ```
 
 Si exit code ≠ `0` en el script: capturar stderr, postearlo como comentario `note` y bloquear la tarea (ver AGENTS.md — Manejo de errores del script send-denial-mail).
@@ -330,7 +329,7 @@ Use `--label error_log` **only** when the file documents a failure — it is
 rendered with emphasis. For milestone narrative and its supporting evidence,
 always use `--label progress`.
 
-### Step 7: Determine confidence
+### Step 7: Record verification notes
 
 Before writing the report, reflect explicitly on the work you just did:
 
@@ -338,18 +337,17 @@ Before writing the report, reflect explicitly on the work you just did:
 - **What's uncertain?** Where are you extrapolating or relying on a single signal?
 - **What edge cases remain?** What did you deliberately not cover, and why?
 
-Pick a score in `0.0–1.0` using the confidence table in §Decision Table. Store
-the score in a shell variable, then post the rationale as a note comment:
+Post the answer as a note comment so the reviewer can see it:
 
 ```bash
-CONFIDENCE=0.87
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:verification"
 ark tasks comments post "$TASK_ID" --label note \
-  --body "Confidence ${CONFIDENCE}: Verified against 2 source documents; one edge case unresolved: Q4 breakdown missing for region EU-West."
+  --body "Verified against 2 source documents; one edge case unresolved: Q4 breakdown missing for region EU-West."
 ```
 
-Score honestly. Confidence measures how verified and complete your output is,
-not how hard you worked.
+If something a human must check stops you from standing behind the output, do
+not complete the task. Post a blocker explaining what must be checked and move
+the task to `blocked` (Workflow 3 / `ark tasks block`).
 
 ### Step 8: Upload the final output
 
@@ -373,25 +371,18 @@ Read from the response:
 
 ### Step 9: Complete the task
 
-Use the same score you posted in the confidence comment:
-
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
+ark tasks complete "$TASK_ID"
 ```
 
-The CLI routes automatically:
-- `≥ 0.85` → transitions to `done`. No human review.
-- `< 0.85` → transitions to `review`. Human approves or requests changes.
-
-Do not inflate confidence to skip review. The score in the confidence comment
-and the score on the `complete` call must match.
+`complete` always requests `done`. You do not choose between `done` and
+`review`: server-side gates decide whether the task needs human review and may
+land it in `review` instead.
 
 Read from the response:
-- `.data.status` → `done` or `review`.
-- If `done` → task complete. Exit.
-- If `review` → task is paused. Exit. The harness will re-trigger you if the human
-  sends it back.
+- `.data.status` → usually `done`; `review` if a server-side gate routed it.
+- Either way, exit. The harness will re-trigger you if a human sends it back.
 
 ---
 
@@ -488,11 +479,11 @@ ark tasks get "$TASK_ID"
 Read `.data.log_path` — your prior workspace still exists. Append to it rather
 than starting fresh. Prior evidence is preserved.
 
-### Step 5: Re-execute, re-determine confidence, write and upload the output
+### Step 5: Re-execute, write and upload the output
 
 Re-run your work addressing the specific feedback. Re-run Workflow 1 Steps 7–8:
-determine a fresh confidence score, post a new confidence comment, and upload
-the revised output in the format the task context requires:
+post fresh verification notes and upload the revised output in the format the
+task context requires:
 
 If the revision involves substantial new reasoning (a new plan, new findings, a
 new analysis), upload new milestones as in Workflow 1 Step 6. Consider using a
@@ -502,10 +493,9 @@ can tell which run produced each milestone. (The API auto-increments
 cannot see the run boundary.)
 
 ```bash
-CONFIDENCE=0.90
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:verification"
 ark tasks comments post "$TASK_ID" --label note \
-  --body "Confidence ${CONFIDENCE}: Addressed <specific feedback>; <what changed and why>."
+  --body "Addressed <specific feedback>; <what changed and why>."
 
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
 ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext \
@@ -514,11 +504,11 @@ ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext \
 
 The output version auto-increments. That is expected.
 
-### Step 6: Complete with the new confidence score
+### Step 6: Complete the task
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
+ark tasks complete "$TASK_ID"
 ```
 
 ---
@@ -699,16 +689,6 @@ deliverable whether it is JSON, CSV, HTML, markdown, a PDF, or any other type.
 
 ## Decision Table
 
-### Confidence thresholds
-
-| Score | Routes to | When to use |
-|---|---|---|
-| `0.90 – 1.00` | `done` | Output is verified, complete, and you are certain it is correct |
-| `0.85 – 0.89` | `done` | Output is solid, minor uncertainty about edge cases |
-| `0.70 – 0.84` | `review` | Output is good but you want a human to verify before it is acted on |
-| `0.50 – 0.69` | `review` | Partial output or significant uncertainty |
-| `< 0.50` | `review` | Very uncertain — consider blocking instead if missing critical inputs |
-
 ### Output delivery pathway
 
 | Label | Shape | Command |
@@ -729,10 +709,10 @@ task with `ark tasks status <id> --status draft`; agents should only claim
 | From | To | Command |
 |---|---|---|
 | `queued` | `in_progress` | `ark tasks claim <id>` |
-| `in_progress` | `done` | `ark tasks complete <id> --confidence ≥0.85` |
-| `in_progress` | `review` | `ark tasks complete <id> --confidence <0.85` |
+| `in_progress` | `done` | `ark tasks complete <id>` |
 | `in_progress` | `blocked` | `ark tasks block <id> --reason "..."` |
 
+Human review (`review`) is decided by server-side gates, not by the agent.
 Any other agent transition returns `422`. Read `.error.detail.allowed` to see
 what is valid from the current state.
 
@@ -890,11 +870,13 @@ Silent failure is never acceptable. On any unrecoverable error:
    ark tasks outputs upload "$TASK_ID" /tmp/run.log --type log --label error_log
    ```
 
-2. Complete with a low confidence score — routes to `review` for human triage:
+2. Post a `blocker` comment explaining what a human must check and move the
+   task to `blocked` (`ark tasks block` does both):
 
    ```bash
-   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-   ark tasks complete "$TASK_ID" --confidence 0.10
+   export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:block"
+   ark tasks block "$TASK_ID" \
+     --reason "Run failed at <step>: <error>. A human must check <what to verify> before re-queueing."
    ```
 
 ---
@@ -903,10 +885,10 @@ Silent failure is never acceptable. On any unrecoverable error:
 
 A successful task execution produces all of the following:
 
-- Task status is `done` or `review` (or `blocked` if a genuine blocker was hit).
+- Task status is `done` (or `review` if a server-side gate routed it, or `blocked` if a genuine blocker was hit).
 - At least one output has been submitted — either `--label report` on success, or `--label error_log` on failure.
 - `log_path` is set on the task (workspace was created).
-- A confidence score is recorded on the task.
+- A verification note is posted on the task.
 - Every input path from `inputs list` was consulted or accounted for.
 
 ---
@@ -947,11 +929,10 @@ ark tasks outputs upload "$TASK_ID" ./phase-1-plan.md --type text --label progre
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:progress:2"
 ark tasks outputs upload "$TASK_ID" ./phase-2-findings.md --type text --label progress
 
-# Determine confidence and post rationale as a comment
-CONFIDENCE=0.91
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:confidence"
+# Post verification notes as a comment
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:note:verification"
 ark tasks comments post "$TASK_ID" --label note \
-  --body "Confidence ${CONFIDENCE}: All figures verified against source CSVs; SKU ranking reproducible. No unresolved edge cases."
+  --body "All figures verified against source CSVs; SKU ranking reproducible. No unresolved edge cases."
 
 # Write the final output — context specifies output_format: summary_json
 # so produce JSON with revenue/target/top-product fields
@@ -961,10 +942,10 @@ export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
 ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.json \
   --type file --label report
 
-# Complete with the same confidence
+# Complete the task
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence $CONFIDENCE
-# → status: done (confidence ≥ 0.85, no human review needed)
+ark tasks complete "$TASK_ID"
+# → status: done (server-side gates may route it to review)
 ```
 
 ---
@@ -1003,7 +984,7 @@ ark tasks outputs upload <id> <file> --type <t> --label progress
 ark tasks outputs submit <id> --type --label  Deliver inline data or register a pre-staged storage path
 ark tasks outputs download <id> [--label]     Stream the latest report (or selected label/version); save with -o
 ark tasks documents url <id> <kind> <rec-id>  Short-lived signed URL (~1h)
-ark tasks complete <id> --confidence <score>  Close the task
+ark tasks complete <id>                       Close the task as done
 ark tasks block <id> --reason <reason>        Signal a blocker
 ark tasks comments list <id>                  Read human feedback on re-queue
 ark tasks get <id>                            Fetch current state + next_commands

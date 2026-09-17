@@ -142,6 +142,84 @@ test_list_all_human_includes_every_page() {
   [[ "$output" == $'[review] one — First\n[review] two — Second\ncount: 2' ]]
 }
 
+test_complete_always_sends_done() {
+  local request_log
+  request_log=$(mktemp)
+  local flags
+  for flags in "" "--confidence 0.10" "--confidence=0.90"; do
+    local output
+    # shellcheck disable=SC2086
+    output=$(
+      source "$ARK"
+      http_request() {
+        printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >"$request_log"
+        HTTP_STATUS="200"
+        HTTP_BODY='{"ok":true,"data":{"id":"task-1","status":"done"}}'
+        HTTP_REQUEST_ID="request-complete"
+        HTTP_IDEMPOTENT_REPLAY="false"
+      }
+      ARK_IDEMPOTENCY_KEY="run-1:complete"
+      main tasks complete task-1 $flags
+    )
+    assert_jq "$output" '.data.status == "done"'
+    [[ "$(<"$request_log")" == 'PATCH /api/tasks/task-1/status {"status":"done"} run-1:complete' ]]
+  done
+  rm -f "$request_log"
+}
+
+test_complete_dry_run_body() {
+  local output
+  output=$(
+    source "$ARK"
+    DRY_RUN=true
+    http_request() { return 1; }
+    cmd_tasks_complete task-1 --confidence 0.10
+  )
+  assert_jq "$output" '.data.would_send.body == {"status":"done"}'
+}
+
+test_complete_rejects_unknown_flag() {
+  local output exit_code
+  set +e
+  output=$( {
+    source "$ARK"
+    http_request() { return 1; }
+    cmd_tasks_complete task-1 --bogus
+  } 2>&1 )
+  exit_code=$?
+  set -e
+  [[ "$exit_code" -eq 2 ]]
+  assert_jq "$output" '.error.code == "bad_argument"'
+}
+
+test_status_ignores_deprecated_confidence() {
+  local request_log output
+  request_log=$(mktemp)
+  output=$(
+    source "$ARK"
+    http_request() {
+      printf '%s' "$3" >"$request_log"
+      HTTP_STATUS="200"
+      HTTP_BODY='{"ok":true,"data":{"id":"task-1","status":"review"}}'
+    }
+    main tasks status task-1 --status review --confidence 0.5 --confidence-score=0.7 --comment-id c-1
+  )
+  assert_jq "$output" '.data.status == "review"'
+  assert_jq "$(<"$request_log")" '. == {"status":"review","comment_id":"c-1"}'
+  rm -f "$request_log"
+}
+
+test_skills_has_no_confidence_routing() {
+  local output
+  output=$(
+    source "$ARK"
+    cmd_skills
+  )
+  assert_jq "$output" '[.. | objects | has("confidence_routing")] | any | not'
+  assert_jq "$output" '[.. | strings | select(test("--confidence(-score)? [0-9]"))] | length == 0'
+  assert_jq "$output" '.data.completion.command == "ark tasks complete <id>"'
+}
+
 run_test() {
   local name="$1"
   "$name"
@@ -156,4 +234,9 @@ run_test test_stats_rejects_arguments
 run_test test_stats_preserves_http_errors
 run_test test_list_all_follows_cursor
 run_test test_list_all_human_includes_every_page
+run_test test_complete_always_sends_done
+run_test test_complete_dry_run_body
+run_test test_complete_rejects_unknown_flag
+run_test test_status_ignores_deprecated_confidence
+run_test test_skills_has_no_confidence_routing
 printf '%s tests passed\n' "$tests_run"
