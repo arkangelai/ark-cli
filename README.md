@@ -88,17 +88,45 @@ ark tasks status "$TASK_ID" --status draft
 
 ### What the agent does at each step
 
-**1. Claim a queued task**
+**1. Atomically claim the next eligible task**
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)
 
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
 CLAIM=$(ark tasks claim-next)
-TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
+ASSIGNMENT=$(printf '%s' "$CLAIM" | jq -c '.data.assignment // empty')
 
-# Empty means no profile-eligible queued task is currently available.
+# data=null means there is no eligible work. A long-running dispatcher should
+# wait its normal poll interval with jitter before starting a new logical poll.
 [[ -n "$TASK_ID" ]] || exit 0
 ```
+
+`claim-next` has no task type/kind filters: the API-key profile owns routing. It
+sends a stable `X-Worker-Id` from `--worker-id`, `ARK_WORKER_ID`,
+`ark config set worker-id`, or a machine fingerprint. Transient `429`, `5xx`, and
+network failures retry with the same key (bounded by `ARK_CLAIM_MAX_RETRIES`,
+default 3, honoring `Retry-After`); `401`, `403`, `409`, and `422` stop
+immediately. The response must carry `data.task` + `data.assignment`, or
+`data=null`; anything else fails with `invalid_response`.
+
+A long-running dispatcher creates one key per poll and applies idle jitter
+outside the one-shot CLI command:
+
+```bash
+while true; do
+  POLL_KEY=$(ark gen-uuid)
+  CLAIM=$(ARK_IDEMPOTENCY_KEY="${POLL_KEY}:claim-next" ark tasks claim-next) || break
+  if [[ "$(printf '%s' "$CLAIM" | jq -r '.data')" == "null" ]]; then
+    sleep $((30 + RANDOM % 6))
+    continue
+  fi
+  launch_worker "$CLAIM"
+done
+```
+
+If a network error remains ambiguous after the command exhausts its retries,
+open the dispatcher circuit; do not generate a new poll key.
 
 For a claimed task with `context.type == "soat_similar_review_scan"`, keep its
 task ID and `run_id`. Page all direct-review targets, preserving the returned
@@ -252,12 +280,13 @@ If a human sends a task back from review, the agent reads the feedback and re-ru
 # New run ID for every re-execution
 TASK_RUN_ID=$(ark gen-uuid)
 
-# Read what the human wants changed
-ark tasks comments list "$TASK_ID" | jq '.data[-1]'
+# Re-enter through the atomic dispatcher claim
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
 
-# Re-claim, re-execute, re-submit, re-complete
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
+# Read what the human wants changed, then re-execute and re-submit
+ark tasks comments list "$TASK_ID" | jq '.data[-1]'
 # ... repeat steps 2–5 ...
 ```
 
@@ -351,8 +380,8 @@ ark tasks update <id>      --log-path=
 ark tasks context <id>     --data='<json>' | --clear          # human only
 ark tasks context-set <id> --set key=value [--set key2=val2]  # agent only, shallow merge
 ark tasks status <id>      --status= [--comment-id=] [--run-id=] [--json]   # --confidence/--confidence-score: deprecated no-ops
-ark tasks claim <id>
-ark tasks claim-next        [--task-type=] [--worker-id=] [--json]
+ark tasks claim-next        [--worker-id=] [--json]         # atomic dispatcher claim (recommended)
+ark tasks claim <id>                                          # legacy/manual claim of a known ID
 ark tasks similar-reviews list <scan-task-id> [--page-size=100] [--after-id=] [--snapshot-at=] [--json]
 ark tasks ask-review <id>   [--reason=]
 ark tasks complete <id>                                        # --confidence: deprecated no-op

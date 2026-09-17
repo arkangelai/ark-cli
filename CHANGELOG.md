@@ -7,6 +7,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Changed (breaking)
+- `ark tasks claim-next` no longer accepts task-selection filters. It accepts
+  only `--worker-id` and `--json`; `--task-type` (or any other argument) fails
+  locally with `bad_argument` (exit 2) and sends no request. The API-key profile
+  owns task types and parent/child order, and the API already rejects any query
+  parameter on `POST /api/tasks/claim-next` with `422`.
+- `ark tasks claim-next` validates the response contract strictly: `data.task` +
+  `data.assignment`, or `data=null` when no work is eligible. Any other shape
+  fails with `invalid_response` (exit 1). Read the task from `.data.task`.
+
+### Added
+- `ark tasks claim-next` retries `429`, `5xx`, timeout and network failures
+  within one logical poll, reusing the same `Idempotency-Key`, with exponential
+  backoff plus jitter and `Retry-After` on `429`. `401`, `403`, `409` and `422`
+  are never retried. Tunable via `ARK_CLAIM_MAX_RETRIES` (default 3),
+  `ARK_CLAIM_BACKOFF_BASE_SECONDS`, `ARK_CLAIM_BACKOFF_MAX_SECONDS` and
+  `ARK_CLAIM_JITTER_PERCENT`. Exhausted network retries report the idempotency
+  key, worker ID and attempt count so dispatchers can open their claim circuit.
+- `ark tasks claim-next --dry-run` prints the request with its
+  `Idempotency-Key` and `X-Worker-Id` headers; human output prints
+  `No eligible tasks` for an empty queue.
+- `tests/claim-next.test.sh` regression suite (contract, replay, empty queue,
+  stable worker identity, error matrix, retry/backoff, concurrent disjoint
+  claims) with `tests/bin/curl` and `tests/bin/sleep` fakes.
+
+### Changed
+- `README.md`, `AGENTS.md`, `skills/` and `ark skills` use the atomic claim
+  exclusively for dispatch, with `${TASK_RUN_ID}:claim-next` idempotency keys
+  (the key suffix the API uses to correlate a claim with its run).
+  `tasks claim <id>` is documented as a legacy/manual operation.
+
 ### Added
 - `ark tasks stats` — fetches the complete task-status histogram from
   `GET /api/tasks/stats` in one request, avoiding exhaustive pagination for
@@ -25,7 +56,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Exact `ark tasks list` filters for `--type` / `--task-type`,
   `--created-by-type`, `--factura-key`, `--client-ref`, `--batch-id`, and
   `--parent` / `--parent-task-id`.
-- `ark tasks claim-next [--task-type]` — atomically claims the next
+- `ark tasks claim-next [--worker-id] [--json]` — atomically claims the next
   profile-eligible task, removing the `list` + `claim` race between workers.
 - `ark tasks ask-review <id> [--reason]` — requests human review without
   completing the task or manipulating its confidence score.

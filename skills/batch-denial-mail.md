@@ -6,7 +6,7 @@ description: >
   lo sube a storage y lo envía por correo al destinatario configurado en el contexto.
   El agente no razona sobre el contenido — solo ejecuta el script y reporta.
   Usar cuando task_type === "batch-denial-mail".
-version: "1.2"
+version: "1.3"
 compatibility: Requiere ark CLI instalado y configurado con api-key y url válidos.
 ---
 
@@ -35,26 +35,20 @@ ark config set api-key <key>
 
 ## Flujo completo
 
-### Paso 1 — Generar run ID e identificar la tarea
+### Paso 1 — Generar run ID y reclamar atómicamente
 
 ```bash
 TASK_RUN_ID=$(ark gen-uuid)
-TASK_ID=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].id')
-TASK_TYPE=$(ark tasks list --status queued --limit 1 | jq -r '.data[0].task_type')
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
+TASK_TYPE=$(printf '%s' "$CLAIM" | jq -r '.data.task.task_type // empty')
 ```
 
-Verificar que `TASK_TYPE` sea `batch-denial-mail`. Si no, usar el skill general `tasks-ark-execution`.
+Si `TASK_ID` está vacío, no hay trabajo elegible. Verificar que `TASK_TYPE` sea
+`batch-denial-mail`; la respuesta ya llega en estado `in_progress`.
 
-### Paso 2 — Reclamar la tarea
-
-```bash
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
-```
-
-Verificar que `.data.status` sea `"in_progress"` antes de continuar.
-
-### Paso 3 — Ejecutar el script
+### Paso 2 — Ejecutar el script
 
 ```bash
 ARK_SCRIPTS_DIR=/ruta/al/repo/tasks-ark-cli/scripts ark audit send-denial-mail "$TASK_ID"
@@ -84,7 +78,7 @@ Si el script termina con exit `0`, el stdout incluye:
 }
 ```
 
-### Paso 4 — Enviar el correo con GOG
+### Paso 3 — Enviar el correo con GOG
 
 **4a. Obtener el Excel para adjuntar**
 
@@ -131,7 +125,7 @@ SENT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 ark tasks context-set "$TASK_ID" --set reply_sent=true --set sent_at="$SENT_AT"
 ```
 
-### Paso 5 — Actualizar las tareas eps_audit individuales
+### Paso 4 — Actualizar las tareas eps_audit individuales
 
 Propagar `reply_sent` a cada tarea referenciada en `context.task_ids`:
 
@@ -149,7 +143,7 @@ done
 
 Si algún PATCH individual falla, registrarlo como comentario `note` en la tarea batch y continuar — no bloquear por un fallo parcial.
 
-### Paso 6 — Completar la tarea
+### Paso 5 — Completar la tarea
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
