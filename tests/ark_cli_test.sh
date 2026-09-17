@@ -72,7 +72,7 @@ test_stats_rejects_arguments() {
   exit_code=$?
   set -e
 
-  [[ "$exit_code" -eq 2 ]]
+  [[ "$exit_code" -eq 2 ]] || return 1
   assert_jq "$output" '.error.code == "bad_argument"'
 }
 
@@ -152,7 +152,8 @@ test_complete_always_sends_done() {
     output=$(
       source "$ARK"
       http_request() {
-        printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >"$request_log"
+        jq -cn --arg m "$1" --arg p "$2" --argjson b "$3" --arg k "$4" \
+          '{method:$m,path:$p,body:$b,key:$k}' >"$request_log"
         HTTP_STATUS="200"
         HTTP_BODY='{"ok":true,"data":{"id":"task-1","status":"done"}}'
         HTTP_REQUEST_ID="request-complete"
@@ -162,7 +163,7 @@ test_complete_always_sends_done() {
       main tasks complete task-1 $flags
     )
     assert_jq "$output" '.data.status == "done"'
-    [[ "$(<"$request_log")" == 'PATCH /api/tasks/task-1/status {"status":"done"} run-1:complete' ]]
+    assert_jq "$(<"$request_log")" '. == {method:"PATCH",path:"/api/tasks/task-1/status",body:{status:"done"},key:"run-1:complete"}' || return 1
   done
   rm -f "$request_log"
 }
@@ -188,7 +189,7 @@ test_complete_rejects_unknown_flag() {
   } 2>&1 )
   exit_code=$?
   set -e
-  [[ "$exit_code" -eq 2 ]]
+  [[ "$exit_code" -eq 2 ]] || return 1
   assert_jq "$output" '.error.code == "bad_argument"'
 }
 
