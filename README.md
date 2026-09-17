@@ -470,8 +470,8 @@ ark tasks list --status blocked \
   --fields id,status,title,created_at
 ```
 
-`--since` and `--until` map to the API creation-time bounds `created_after` and
-`created_before`. Date-only values and full ISO 8601 timestamps are forwarded
+`--since` and `--until` are sent as the API creation-time bounds `since` and
+`until`. Date-only values and full ISO 8601 timestamps are forwarded
 unchanged. `--brief` is shorthand for
 `--fields id,status,title,created_at`; it cannot be combined with `--fields`.
 When paginating, pass `meta.next_cursor` back to `--cursor` verbatim.

@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.6.2] — 2026-09-17
+
+### Fixed
+- `ark tasks list --since/--until` now sends the API's `since`/`until` query
+  parameters. It sent `created_after`/`created_before`, which the API first
+  ignored (returning unfiltered rows) and now rejects with `422` (#26).
+
 ## [0.6.1] — 2026-09-17
 
 ### Changed (breaking)

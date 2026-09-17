@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARK_VERSION="0.6.1"
+ARK_VERSION="0.6.2"
 ARK_CONFIG_FILE="${ARK_CONFIG_FILE:-${HOME}/.config/ark/config}"
 ARK_DEFAULT_API_URL="https://audit.arkangel.ai"
 ARK_DEFAULT_LIMIT="20"
@@ -707,7 +707,7 @@ validate_task_fields() {
 
 cmd_tasks_list() {
   local status_f="" priority_f="" limit="$ARK_DEFAULT_LIMIT" cursor="" fetch_all="false"
-  local created_after="" created_before="" sort_f="" order_f="" fields_f=""
+  local since_f="" until_f="" sort_f="" order_f="" fields_f=""
   local task_type="" created_by_type="" factura_key="" client_ref=""
   local batch_id="" parent_task_id="" option_name=""
   local brief="false"
@@ -733,10 +733,10 @@ cmd_tasks_list() {
       --limit)      [[ $# -ge 2 ]] || { err_json "bad_argument" "--limit requires a value" "false" "{}" ""; exit 2; }; shift; limit="$1" ;;
       --cursor=*)   cursor="${1#--cursor=}" ;;
       --cursor)     [[ $# -ge 2 ]] || { err_json "bad_argument" "--cursor requires a value" "false" "{}" ""; exit 2; }; shift; cursor="$1" ;;
-      --since=*)    created_after="${1#--since=}"; require_option_value "--since" "$created_after" ;;
-      --since)      [[ $# -ge 2 ]] || require_option_value "--since" ""; shift; created_after="$1"; require_option_value "--since" "$created_after" ;;
-      --until=*)    created_before="${1#--until=}"; require_option_value "--until" "$created_before" ;;
-      --until)      [[ $# -ge 2 ]] || require_option_value "--until" ""; shift; created_before="$1"; require_option_value "--until" "$created_before" ;;
+      --since=*)    since_f="${1#--since=}"; require_option_value "--since" "$since_f" ;;
+      --since)      [[ $# -ge 2 ]] || require_option_value "--since" ""; shift; since_f="$1"; require_option_value "--since" "$since_f" ;;
+      --until=*)    until_f="${1#--until=}"; require_option_value "--until" "$until_f" ;;
+      --until)      [[ $# -ge 2 ]] || require_option_value "--until" ""; shift; until_f="$1"; require_option_value "--until" "$until_f" ;;
       --sort=*)     sort_f="${1#--sort=}"; require_option_value "--sort" "$sort_f" ;;
       --sort)       [[ $# -ge 2 ]] || require_option_value "--sort" ""; shift; sort_f="$1"; require_option_value "--sort" "$sort_f" ;;
       --order=*)    order_f="${1#--order=}"; require_option_value "--order" "$order_f" ;;
@@ -776,8 +776,8 @@ cmd_tasks_list() {
     [[ -n "$batch_id" ]]       && q=$(append_query_param "$q" "batch_id" "$batch_id")
     [[ -n "$parent_task_id" ]] && q=$(append_query_param "$q" "parent_task_id" "$parent_task_id")
     [[ -n "$page_cursor" ]]    && q=$(append_query_param "$q" "cursor" "$page_cursor")
-    [[ -n "$created_after" ]]  && q=$(append_query_param "$q" "created_after" "$created_after")
-    [[ -n "$created_before" ]] && q=$(append_query_param "$q" "created_before" "$created_before")
+    [[ -n "$since_f" ]]  && q=$(append_query_param "$q" "since" "$since_f")
+    [[ -n "$until_f" ]] && q=$(append_query_param "$q" "until" "$until_f")
     [[ -n "$sort_f" ]]         && q=$(append_query_param "$q" "sort" "$sort_f")
     [[ -n "$order_f" ]]        && q=$(append_query_param "$q" "order" "$order_f")
     [[ -n "$fields_f" ]]       && q=$(append_query_param "$q" "fields" "$fields_f")
