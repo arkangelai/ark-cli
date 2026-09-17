@@ -366,6 +366,8 @@ ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.ext \
   --type file --label report
 ```
 
+**SOAT reports also carry `--grounding`.** See "SOAT grounding" below.
+
 Read from the response:
 - `.data.version` → auto-incremented per `(type, label)`. On a re-run this will
   be `2`, `3`, etc. Expected, not an error.
@@ -706,6 +708,40 @@ deliverable whether it is JSON, CSV, HTML, markdown, a PDF, or any other type.
 | Any label, pre-staged in Storage | Registered by reference | `outputs submit --type <t> --label <l> --storage-path 'storage://...' --size <bytes>` |
 | Any label, larger than 500 MB | Stage out-of-band first | Stage to Storage → `outputs submit --storage-path` |
 
+### SOAT grounding
+
+A SOAT `report` output declares which OCR document was adjudicated and which
+pages were read. Send it with `--grounding` on either `outputs submit` or
+`outputs upload`. The flag takes inline JSON, `@path/to/file.json`, or `-` to
+read the block from stdin. `--grounding-contract-version 1` is optional.
+
+```json
+{"documents":[{"input_id":"<uuid>","ocr_sha256":"<sha>","pages_read":"1-93","pages_cited":[12,40]}]}
+```
+
+```bash
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:output:report"
+ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.json \
+  --type file --label report \
+  --grounding "@/tmp/grounding-${TASK_ID}.json" \
+  --grounding-contract-version 1
+```
+
+| Field | Where it comes from |
+|---|---|
+| `input_id` | `ark tasks inputs list <id>` — an OCR input of this task |
+| `ocr_sha256` | `ark tasks inputs ocr <id> <input-id>` — of that same input |
+| `pages_read` | Compact 1-based ranges **within that document**: `"1-19,45,60-72"` |
+| `pages_cited` | Pages cited as evidence, 1-based within the document, a subset of `pages_read` |
+
+Use one entry in `documents` per OCR document; coverage is the sum across them.
+
+This is an attestation, not proof of reading. The server owns the denominator
+(it knows each document's real page count from the task inputs), compares your
+declaration against it, and answers `422` when the block does not hold. The CLI
+checks only that the value parses as JSON; on invalid JSON it fails with
+`bad_argument` and exit 2 without sending a request.
+
 ### Status transitions available to you
 
 Pre-agent states follow `hold -> draft -> queued`. A human can release a held
@@ -997,13 +1033,14 @@ ark tasks ingest-dir <dir> --map subdir-as-case --task-type <type> --batch-id <i
 ark tasks release-batch --batch-id <id> --limit <N>
                                               Release held batch tasks to draft (human key only)
 ark tasks comments post <id> --label note     Post progress updates
-ark tasks outputs upload <id> <file> --type <t> --label report
-                                              Upload the final deliverable (format per task context)
+ark tasks outputs upload <id> <file> --type <t> --label report [--grounding <json|@file|->]
+                                              Upload the final deliverable (format per task context); SOAT reports send --grounding
 ark tasks outputs upload <id> <file> --type <t> --label artifact
                                               Upload a complementary file supporting the deliverable
 ark tasks outputs upload <id> <file> --type <t> --label progress
                                               Upload an intermediate work product
-ark tasks outputs submit <id> --type --label  Deliver inline data or register a pre-staged storage path
+ark tasks outputs submit <id> --type --label [--grounding <json|@file|->]
+                                              Deliver inline data or register a pre-staged storage path
 ark tasks outputs download <id> [--label]     Stream the latest report (or selected label/version); save with -o
 ark tasks documents url <id> <kind> <rec-id>  Short-lived signed URL (~1h)
 ark tasks complete <id>                       Close the task as done

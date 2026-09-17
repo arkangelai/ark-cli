@@ -198,6 +198,33 @@ ark tasks outputs submit "$TASK_ID" \
   --size 2500000
 ```
 
+**SOAT reports: send the grounding block.** A SOAT report output declares which
+OCR document was adjudicated and which pages were read. Both `submit` and
+`upload` take `--grounding`, inline or as `@path/to/file.json`, or `-` to read
+it from stdin:
+
+```bash
+cat > /tmp/grounding-${TASK_ID}.json <<'JSON'
+{"documents":[{"input_id":"<uuid>","ocr_sha256":"<sha>","pages_read":"1-93","pages_cited":[12,40]}]}
+JSON
+
+ark tasks outputs upload "$TASK_ID" /tmp/output-${TASK_ID}.json \
+  --type file --label report \
+  --grounding "@/tmp/grounding-${TASK_ID}.json" \
+  --grounding-contract-version 1
+```
+
+`input_id` comes from `ark tasks inputs list <id>` and `ocr_sha256` from
+`ark tasks inputs ocr <id> <input-id>`. Pages are 1-based **within each
+document**, `pages_read` is a compact range (`"1-19,45,60-72"`), and
+`pages_cited` must be a subset of `pages_read`. Use one entry per OCR document
+when the folio spans several.
+
+It is an attestation, not proof of reading: the server owns the page count and
+checks the block against the real size of the case, answering `422` when it does
+not hold. The CLI validates only that the value parses as JSON and fails locally
+with `bad_argument` (exit 2), sending no request, when it does not.
+
 To read a task's current primary result, stream the latest `report` version
 directly to another command or save it to disk:
 
@@ -415,8 +442,10 @@ ark tasks comments delete <id> <comment-id>
 ark tasks outputs list <id>
 ark tasks outputs download <id> [--label=report] [--version=N] [-o <file> | --output=<file>]
 ark tasks outputs submit <id>  --type=json|text|file|screenshot --label= [--data=|--data-file=] [--storage-path=] [--size=] [--run-id=]
+                               [--grounding=<json|@file|->] [--grounding-contract-version=1]
 ark tasks outputs create <id>  # alias of submit; also accepts --output-type and --json
 ark tasks outputs upload <id> <file-path> --type= --label= [--local-path=]
+                               [--grounding=<json|@file|->] [--grounding-contract-version=1]
 ark tasks outputs get <id> <output-id>
 ark soat corrections similar-review <case-id> --scan-task-id= --item-key= --baseline-output-id= [--json]
 ark knowledge files list [--task-type=audit|hospital_devolucion|hospital_preventiva]

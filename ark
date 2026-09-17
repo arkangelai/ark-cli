@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ARK_VERSION="0.6.2"
+ARK_VERSION="0.6.3"
 ARK_CONFIG_FILE="${ARK_CONFIG_FILE:-${HOME}/.config/ark/config}"
 ARK_DEFAULT_API_URL="https://audit.arkangel.ai"
 ARK_DEFAULT_LIMIT="20"
@@ -2218,12 +2218,59 @@ cmd_tasks_outputs_list() {
   ok_response "$data" "{}" "{}" "$meta"
 }
 
+# ─── grounding (#782) ──────────────────────────────────────────────────────────
+# Resolve a --grounding value into GROUNDING_JSON (compact JSON). Accepts inline
+# JSON, @path/to/file.json, or - to read stdin.
+#
+# Local validation is deliberately limited to "does this parse as JSON". The
+# server owns the grounding schema and rejects a malformed or dishonest block
+# with 422. The CLI does not second-guess it.
+GROUNDING_JSON=""
+GROUNDING_CONTRACT_VERSION=""
+ARK_GROUNDING_USAGE='--grounding '"'"'{"documents":[{"input_id":"<uuid>","ocr_sha256":"<sha>","pages_read":"1-93","pages_cited":[12,40]}]}'"'"' (or @file.json, or - for stdin)'
+
+resolve_grounding_value() {
+  local raw="$1" usage="${2:-}" value="" path=""
+  GROUNDING_JSON=""
+  if [[ "$raw" == "-" ]]; then
+    value=$(cat)
+  elif [[ "$raw" == @* ]]; then
+    path="${raw#@}"
+    if [[ ! -f "$path" ]]; then
+      err_json "bad_argument" "--grounding file not found: ${path}" "false" \
+        "$(jq -n --arg p "$path" '{path:$p}')" "$usage"
+      return 1
+    fi
+    value=$(cat "$path")
+  else
+    value="$raw"
+  fi
+  if ! printf '%s' "$value" | jq -e '.' >/dev/null 2>&1; then
+    err_json "bad_argument" "--grounding must be valid JSON (inline, @file, or - for stdin)" "false" "{}" "$usage"
+    return 1
+  fi
+  GROUNDING_JSON=$(printf '%s' "$value" | jq -c '.')
+}
+
+# The server decides which contract versions it honours; the CLI only makes sure
+# the value is an integer so it can be sent as one.
+resolve_grounding_contract_version() {
+  local raw="$1" usage="${2:-}"
+  GROUNDING_CONTRACT_VERSION=""
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    err_json "bad_argument" "--grounding-contract-version must be an integer (currently 1)" "false" "{}" "$usage"
+    return 1
+  fi
+  GROUNDING_CONTRACT_VERSION="$raw"
+}
+
 # ─── tasks outputs submit ──────────────────────────────────────────────────────
 cmd_tasks_outputs_submit() {
   local id="${1:-}"; shift || true
   [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks outputs submit <id> --type <type> --label <label>"; exit 2; }
 
   local otype="" label="" data_json="" data_file="" storage_path="" size_bytes="" run_id=""
+  local grounding_raw="" grounding_set="false" grounding_version_raw=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)         otype="${1#--type=}" ;;
@@ -2242,11 +2289,21 @@ cmd_tasks_outputs_submit() {
       --size)           shift; size_bytes="$1" ;;
       --run-id=*)       run_id="${1#--run-id=}" ;;
       --run-id)         shift; run_id="$1" ;;
+      --grounding=*)    grounding_raw="${1#--grounding=}"; grounding_set="true" ;;
+      --grounding)      shift; grounding_raw="$1"; grounding_set="true" ;;
+      --grounding-contract-version=*) grounding_version_raw="${1#--grounding-contract-version=}" ;;
+      --grounding-contract-version)   shift; grounding_version_raw="$1" ;;
       --json)           force_json_output ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
   [[ -z "$otype" || -z "$label" ]] && { err_json "bad_argument" "--type and --label are required" "false" "{}" "ark tasks outputs submit ${id} --type <type> --label <label>"; exit 2; }
+  if [[ "$grounding_set" == "true" ]]; then
+    resolve_grounding_value "$grounding_raw" "$ARK_GROUNDING_USAGE" || exit 2
+  fi
+  if [[ -n "$grounding_version_raw" ]]; then
+    resolve_grounding_contract_version "$grounding_version_raw" "$ARK_GROUNDING_USAGE" || exit 2
+  fi
   if [[ -n "$data_json" && -n "$data_file" ]]; then
     err_json "bad_argument" "--data and --data-file are mutually exclusive" "false" "{}" ""; exit 2
   fi
@@ -2274,6 +2331,9 @@ cmd_tasks_outputs_submit() {
   [[ -n "$storage_path" ]] && body=$(printf '%s' "$body" | jq --arg sp "$storage_path" '. + {storage_path:$sp}')
   [[ -n "$size_bytes" ]]   && body=$(printf '%s' "$body" | jq --argjson sz "$size_bytes" '. + {size_bytes:$sz}')
   [[ -n "$run_id" ]]       && body=$(printf '%s' "$body" | jq --arg rid "$run_id" '. + {run_id:$rid}')
+  # JSON endpoint: grounding travels as a JSON object, the contract version as an integer.
+  [[ -n "$GROUNDING_JSON" ]] && body=$(printf '%s' "$body" | jq --argjson g "$GROUNDING_JSON" '. + {grounding:$g}')
+  [[ -n "$GROUNDING_CONTRACT_VERSION" ]] && body=$(printf '%s' "$body" | jq --argjson gv "$GROUNDING_CONTRACT_VERSION" '. + {grounding_contract_version:$gv}')
 
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "POST" "/api/tasks/${id}/outputs" "$body"; return; }
 
@@ -2298,6 +2358,7 @@ cmd_tasks_outputs_upload() {
   [[ -f "$file_path" ]] || { err_json "bad_argument" "File not found: ${file_path}" "false" "{}" ""; exit 2; }
 
   local otype="" label="" local_path=""
+  local grounding_raw="" grounding_set="false" grounding_version_raw=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)       otype="${1#--type=}" ;;
@@ -2306,10 +2367,20 @@ cmd_tasks_outputs_upload() {
       --label)        shift; label="$1" ;;
       --local-path=*) local_path="${1#--local-path=}" ;;
       --local-path)   shift; local_path="$1" ;;
+      --grounding=*)  grounding_raw="${1#--grounding=}"; grounding_set="true" ;;
+      --grounding)    shift; grounding_raw="$1"; grounding_set="true" ;;
+      --grounding-contract-version=*) grounding_version_raw="${1#--grounding-contract-version=}" ;;
+      --grounding-contract-version)   shift; grounding_version_raw="$1" ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
   [[ -z "$otype" || -z "$label" ]] && { err_json "bad_argument" "--type and --label are required" "false" "{}" "ark tasks outputs upload ${id} ${file_path} --type <json|text|file|screenshot|log> --label <report|artifact|error_log|progress|diff>"; exit 2; }
+  if [[ "$grounding_set" == "true" ]]; then
+    resolve_grounding_value "$grounding_raw" "$ARK_GROUNDING_USAGE" || exit 2
+  fi
+  if [[ -n "$grounding_version_raw" ]]; then
+    resolve_grounding_contract_version "$grounding_version_raw" "$ARK_GROUNDING_USAGE" || exit 2
+  fi
 
   [[ -z "$local_path" ]] && local_path=$(abs_path "$file_path")
 
@@ -2325,12 +2396,17 @@ cmd_tasks_outputs_upload() {
     local body
     body=$(jq -n --arg f "$file_path" --arg t "$otype" --arg l "$label" --arg lp "$local_path" \
       '{multipart:{file:("@"+$f),output_type:$t,label:$l,local_path:$lp}}')
+    # Multipart endpoint: grounding is a JSON-encoded STRING form field.
+    [[ -n "$GROUNDING_JSON" ]] && body=$(printf '%s' "$body" | jq --arg g "$GROUNDING_JSON" '.multipart += {grounding:$g}')
+    [[ -n "$GROUNDING_CONTRACT_VERSION" ]] && body=$(printf '%s' "$body" | jq --argjson gv "$GROUNDING_CONTRACT_VERSION" '.multipart += {grounding_contract_version:$gv}')
     dry_run_response "POST" "/api/tasks/${id}/outputs/upload" "$body"
     return
   fi
 
   local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
   local fields=("file=@${file_path}" "output_type=${otype}" "label=${label}" "local_path=${local_path}")
+  [[ -n "$GROUNDING_JSON" ]] && fields+=("grounding=${GROUNDING_JSON}")
+  [[ -n "$GROUNDING_CONTRACT_VERSION" ]] && fields+=("grounding_contract_version=${GROUNDING_CONTRACT_VERSION}")
 
   http_upload "POST" "/api/tasks/${id}/outputs/upload" "$ikey" "${fields[@]}"
   [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]] || handle_http_error "$HTTP_STATUS" "$HTTP_BODY"
@@ -3036,6 +3112,7 @@ cmd_skills() {
           "# Write the final output in the format the task context requires",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
           "ark tasks outputs upload \"$TASK_ID\" /tmp/output-${TASK_ID}.json --type file --label report",
+          "# SOAT (audit_soat and the lens children): the report must carry --grounding. See workflow upload_soat_report.",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
           "ark tasks complete \"$TASK_ID\""
         ],
@@ -3072,6 +3149,23 @@ cmd_skills() {
           "# Primary deliverable: final output in the format the task context requires",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
           "ark tasks outputs upload \"$TASK_ID\" /tmp/output-${TASK_ID}.ext --type file --label report"
+        ],
+        upload_soat_report: [
+          "# SOAT report outputs carry a grounding block (#782): which OCR document was",
+          "# adjudicated and which pages were read. Without it the server cannot score",
+          "# coverage and the task cannot close.",
+          "# 1. input_id comes from the inputs list; ocr_sha256 and the page count from the OCR of that same input",
+          "ark tasks inputs list \"$TASK_ID\" | jq -r \".data[].id\"",
+          "ark tasks inputs ocr \"$TASK_ID\" \"$INPUT_ID\" | jq \u0027{id:.data.id, ocr_sha256:.data.ocr_sha256, pages:(.data.ocr_pages|length)}\u0027",
+          "# 2. Build the block. Pages are 1-based WITHIN each document; pages_cited is a subset of pages_read.",
+          "cat > /tmp/grounding-${TASK_ID}.json <<\u0027JSON\u0027",
+          "{\"documents\":[{\"input_id\":\"<uuid>\",\"ocr_sha256\":\"<sha>\",\"pages_read\":\"1-93\",\"pages_cited\":[12,40]}]}",
+          "JSON",
+          "# 3. Send it with the report. Accepts inline JSON, @file, or - for stdin.",
+          "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
+          "ark tasks outputs upload \"$TASK_ID\" /tmp/output-${TASK_ID}.json --type file --label report --grounding \"@/tmp/grounding-${TASK_ID}.json\" --grounding-contract-version 1",
+          "# Same flag on the JSON endpoint: ark tasks outputs submit \"$TASK_ID\" --type json --label report --data-file report.json --grounding \"@/tmp/grounding-${TASK_ID}.json\"",
+          "# It is an attestation, not proof: the server checks it against the real page count of the case and answers 422 if it does not hold."
         ],
         upload_output_artifact: [
           "# Complementary file that supports the primary deliverable",
@@ -3240,7 +3334,9 @@ cmd_skills() {
         },
         outputs: {
           output_type: "deliverable format; set with outputs submit/upload --type",
-          label: "deliverable role; set with outputs submit/upload --label"
+          label: "deliverable role; set with outputs submit/upload --label",
+          grounding: "SOAT report provenance (#782): documents adjudicated, pages_read and pages_cited. Set with outputs submit/upload --grounding <json|@file|->; see workflow upload_soat_report",
+          grounding_contract_version: "explicit producer cutover to the strict grounding contract; set with outputs submit/upload --grounding-contract-version 1"
         },
         events: {
           actor_type: "event actor kind"
@@ -3300,7 +3396,7 @@ cmd_skills() {
         "eps_audit":           "Audita factura médica en 3 capas. Usar workflow execute_queued_task.",
         "hospital_preventiva": "Auditoría hospitalaria preventiva. Usar workflow execute_queued_task.",
         "hospital_devolucion": "Devolución hospitalaria. Usar workflow execute_queued_task.",
-        "audit_soat":          "Audita factura SOAT. Usar workflow execute_queued_task.",
+        "audit_soat":          "Audita factura SOAT. Usar workflow execute_queued_task; el output report va con --grounding (workflow upload_soat_report).",
         "soat_glosa_mail":     "Comunicación de glosas SOAT. Usar workflow execute_queued_task o flujo específico del lote si aplica.",
         "hospital_devolucion_batch":      "Lote de glosas (Excel/CSV). Procesado por hospital-devolucion-batch-parse, que crea una task hospital_devolucion por glosa.",
         "batch-denial-mail":              "DELEGAR a ark audit send-denial-mail — NO razonar ni generar el Excel manualmente. Ver workflow batch_denial_mail.",
@@ -3526,11 +3622,23 @@ OUTPUTS
   ark tasks outputs submit <id>      Submit an inline or pre-staged deliverable (agent only)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
     [--data=<json>|--data-file=<path>]  [--storage-path=]  [--size=<bytes>]  [--run-id=]  [--json]
+    [--grounding=<json|@file|->]  [--grounding-contract-version=1]
   ark tasks outputs create <id>      Alias of outputs submit; also accepts --output-type
   ark tasks outputs upload <id> <file-path>   Upload a file deliverable (agent only, ≤ 500 MB)
     --type=json|text|file|screenshot|log  --label=report|artifact|error_log|progress|diff
-    [--local-path=]
+    [--local-path=]  [--grounding=<json|@file|->]  [--grounding-contract-version=1]
   ark tasks outputs get <id> <output-id>   Fetch a single output
+
+  SOAT grounding (#782). Send it with the report output:
+    --grounding '{"documents":[{"input_id":"<uuid>","ocr_sha256":"<sha>",
+                                "pages_read":"1-93","pages_cited":[12,40]}]}'
+    Also accepts @path/to/grounding.json, or - to read the block from stdin.
+    Pages are 1-based WITHIN each document; pages_cited must be a subset of
+    pages_read. input_id comes from 'ark tasks inputs list <id>', ocr_sha256
+    from 'ark tasks inputs ocr <id> <input-id>'.
+    It is an attestation: the server checks it against the real page count of
+    the case and rejects a block it does not accept with 422. The CLI only
+    checks that the value parses as JSON.
 
 DOCUMENTS
   ark tasks documents url <id> <input|output> <record-id>
