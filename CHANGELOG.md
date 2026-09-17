@@ -43,6 +43,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added `hold` and `draft` to task status help and surfaced task statuses in `ark skills`.
 
 ### Changed
+- `ark tasks complete <id>` always requests `done`; it no longer maps a
+  confidence score to `done`/`review` or sends `confidence_score`. Whether a
+  task needs human review is decided by server-side gates (salmona-api#1123).
+  Agent docs, `ark skills` (`confidence_routing` replaced by `completion`) and
+  skills now tell agents to post a blocker and move the task to `blocked` when a
+  human must check something, instead of completing with a low score.
 - `ark tasks list --all` now follows `meta.next_cursor` until all matching tasks
   are returned instead of silently truncating the result to one page of 100.
 - `ark tasks comments post` now uses `--label` as its documented flag, matching
@@ -55,6 +61,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Aligned `ingest-dir` with the Salmona bulk-ingest API on `main`: input batch
   registration now sends `files[]` with stable `client_ref` values and parses
   both `created` and `deduped` task rows on retry/resume.
+
+### Deprecated
+- `--confidence` on `tasks complete` and `--confidence`/`--confidence-score` on
+  `tasks status` are accepted as no-ops for existing callers and never sent.
 
 ### Fixed
 - URL-encoded every `ark tasks list` query value so opaque pagination cursors

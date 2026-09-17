@@ -75,9 +75,9 @@ lifecycle.
       │                                       │
       ├── blocked  (agent hit a blocker) ─────┤  human resolves, re-queues
       │                                       │
-      ├── review   (confidence < 0.85) ───────┤  human approves or requests changes
+      ├── review   (server-side gate) ────────┤  human approves or requests changes
       │
-      └── done     (confidence ≥ 0.85, or human approved)
+      └── done     (agent completed, or human approved)
 ```
 
 To release a held task into OCR/pre-processing, run:
@@ -122,8 +122,7 @@ ark tasks outputs create "$TASK_ID" --output-type json --label report \
 
 # Continue only after meta.http_status == 201.
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks status "$TASK_ID" --status done --confidence-score 1 \
-  --run-id "$RUN_ID" --json
+ark tasks status "$TASK_ID" --status done --run-id "$RUN_ID" --json
 ```
 
 Reports must be smaller than 500 KiB. Never call `ask-review`,
@@ -230,12 +229,13 @@ Track ingest progress without scanning tasks:
 ark batches status carga-soat-2026-07 --missing-limit 100
 ```
 
-**5. Complete with a confidence score**
+**5. Complete the task**
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
-ark tasks complete "$TASK_ID" --confidence 0.92
-# ≥ 0.85 → done (no review)
-# < 0.85 → review (human decides)
+ark tasks complete "$TASK_ID"
+# Always requests done. Server-side gates decide whether the task needs human
+# review (and may land it in review). If a human must check something first,
+# block instead (step 6) with a reason that says what to check.
 ```
 
 **6. Signal a blocker if stuck**
@@ -350,12 +350,12 @@ ark tasks create           --title= [--description=] [--priority=] [--deadline=]
 ark tasks update <id>      --log-path=
 ark tasks context <id>     --data='<json>' | --clear          # human only
 ark tasks context-set <id> --set key=value [--set key2=val2]  # agent only, shallow merge
-ark tasks status <id>      --status= [--confidence=|--confidence-score=] [--comment-id=] [--run-id=] [--json]
+ark tasks status <id>      --status= [--comment-id=] [--run-id=] [--json]   # --confidence/--confidence-score: deprecated no-ops
 ark tasks claim <id>
 ark tasks claim-next        [--task-type=] [--worker-id=] [--json]
 ark tasks similar-reviews list <scan-task-id> [--page-size=100] [--after-id=] [--snapshot-at=] [--json]
 ark tasks ask-review <id>   [--reason=]
-ark tasks complete <id>    --confidence=
+ark tasks complete <id>                                        # --confidence: deprecated no-op
 ark tasks block <id>       --reason=
 ark tasks delete <id>
 ark tasks ingest-dir <dir> --map=subdir-as-case --task-type= --batch-id=

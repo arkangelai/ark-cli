@@ -382,7 +382,7 @@ next_cmds() {
     case "$key" in
       claim)           cmd="ark tasks claim ${id}" ;;
       ask_review|ask-review) cmd="ark tasks ask-review ${id} --reason \"<reason>\"" ;;
-      complete)        cmd="ark tasks complete ${id} --confidence <0.0-1.0>" ;;
+      complete)        cmd="ark tasks complete ${id}" ;;
       block)           cmd="ark tasks block ${id} --reason \"<reason>\"" ;;
       set_workspace)   cmd="ark tasks update ${id} --log-path \"<storage-path>\"" ;;
       add_output)      cmd="ark tasks outputs submit ${id} --type <type> --label <label>" ;;
@@ -1088,15 +1088,14 @@ cmd_tasks_status() {
   local id="${1:-}"; shift || true
   [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" ""; exit 2; }
 
-  local status="" confidence="" comment_id="" run_id=""
+  local status="" comment_id="" run_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)     status="${1#--status=}" ;;
       --status)       shift; status="$1" ;;
-      --confidence=*) confidence="${1#--confidence=}" ;;
-      --confidence)   shift; confidence="$1" ;;
-      --confidence-score=*) confidence="${1#--confidence-score=}" ;;
-      --confidence-score)   shift; confidence="$1" ;;
+      # Deprecated no-ops: confidence no longer routes or is sent (salmona-api#1123).
+      --confidence=*|--confidence-score=*) ;;
+      --confidence|--confidence-score)     shift ;;
       --comment-id=*) comment_id="${1#--comment-id=}" ;;
       --comment-id)   shift; comment_id="$1" ;;
       --run-id=*)     run_id="${1#--run-id=}" ;;
@@ -1108,7 +1107,6 @@ cmd_tasks_status() {
   [[ -z "$status" ]] && { err_json "bad_argument" "--status is required" "false" "{}" ""; exit 2; }
 
   local body; body=$(jq -n --arg s "$status" '{status:$s}')
-  [[ -n "$confidence" ]] && body=$(printf '%s' "$body" | jq --argjson c "$confidence" '. + {confidence_score:$c}')
   [[ -n "$comment_id" ]] && body=$(printf '%s' "$body" | jq --arg cid "$comment_id" '. + {comment_id:$cid}')
   [[ -n "$run_id" ]]     && body=$(printf '%s' "$body" | jq --arg rid "$run_id" '. + {run_id:$rid}')
 
@@ -1349,26 +1347,20 @@ cmd_tasks_ask_review() {
 # ─── tasks complete ────────────────────────────────────────────────────────────
 cmd_tasks_complete() {
   local id="${1:-}"; shift || true
-  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks complete <id> --confidence <0.0-1.0>"; exit 2; }
+  [[ -z "$id" ]] && { err_json "bad_argument" "Task ID required" "false" "{}" "ark tasks complete <id>"; exit 2; }
 
-  local confidence=""
+  # Completion always requests `done`. Whether a task needs human review is
+  # decided by server-side gates, not by the agent (salmona-api#1123).
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --confidence=*) confidence="${1#--confidence=}" ;;
-      --confidence)   shift; confidence="$1" ;;
+      # Deprecated no-op: accepted for existing callers, never sent.
+      --confidence=*) ;;
+      --confidence)   shift ;;
       *) err_json "bad_argument" "Unknown: $1" "false" "{}" ""; exit 2 ;;
     esac; shift || true
   done
-  [[ -z "$confidence" ]] && { err_json "bad_argument" "--confidence is required" "false" "{}" "ark tasks complete ${id} --confidence <0.0-1.0>"; exit 2; }
 
-  local target
-  if awk "BEGIN {exit !($confidence >= 0.85)}"; then
-    target="done"
-  else
-    target="review"
-  fi
-
-  local body; body=$(jq -n --arg s "$target" --argjson c "$confidence" '{status:$s,confidence_score:$c}')
+  local body; body=$(jq -n '{status:"done"}')
   [[ "$DRY_RUN" == "true" ]] && { dry_run_response "PATCH" "/api/tasks/${id}/status" "$body"; return; }
 
   local ikey="${ARK_IDEMPOTENCY_KEY:-$(gen_uuid)}"
@@ -2960,7 +2952,7 @@ cmd_skills() {
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:output:report\"",
           "ark tasks outputs upload \"$TASK_ID\" /tmp/output-${TASK_ID}.json --type file --label report",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
-          "ark tasks complete \"$TASK_ID\" --confidence 0.92"
+          "ark tasks complete \"$TASK_ID\""
         ],
         similar_review_scan: [
           "# Applies only when task.context.type == soat_similar_review_scan",
@@ -2974,7 +2966,7 @@ cmd_skills() {
           "ark tasks outputs create \"$TASK_ID\" --output-type json --label report --run-id \"$RUN_ID\" --data-file report.json --json",
           "# Confirm meta.http_status == 201 before completing",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
-          "ark tasks status \"$TASK_ID\" --status done --confidence-score 1 --run-id \"$RUN_ID\" --json",
+          "ark tasks status \"$TASK_ID\" --status done --run-id \"$RUN_ID\" --json",
           "# Never call ask-review, review/decision, corrections/apply, create review tasks, or publish proposals"
         ],
         create_followon_task: [
@@ -3070,7 +3062,7 @@ cmd_skills() {
           "ark tasks update \"$TASK_ID\" --context \u0027{\"reply_sent\": true, \"sent_at\": \"<iso>\"}\u0027",
           "# Paso 7 — completar",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
-          "ark tasks complete \"$TASK_ID\" --confidence 1.0"
+          "ark tasks complete \"$TASK_ID\""
         ],
         learnings_list: [
           "ark learnings files list",
@@ -3109,7 +3101,7 @@ cmd_skills() {
           "ark tasks context-set \"$TASK_ID\" --set reply_sent=true --set sent_at=\"<iso>\"",
           "# Paso 7 — completar",
           "export ARK_IDEMPOTENCY_KEY=\"${TASK_RUN_ID}:complete\"",
-          "ark tasks complete \"$TASK_ID\" --confidence 1.0"
+          "ark tasks complete \"$TASK_ID\""
         ]
       },
       exit_codes: {
@@ -3179,9 +3171,12 @@ cmd_skills() {
         completion_order: ["persist report and confirm 201","status done with run_id"],
         forbidden: ["ask-review","review/decision","corrections/apply","review tasks","automatic proposal publication"]
       },
-      confidence_routing: {
-        ">=0.85": "transitions to done — no human review needed",
-        "<0.85":  "transitions to review — awaits human approval"
+      completion: {
+        command: "ark tasks complete <id>",
+        result: "requests status done; the agent does not choose between done and review",
+        human_review: "decided by server-side gates (coverage, self-review, parent close); the server may land the task in review",
+        needs_human_check: "post a blocker comment explaining what a human must check, then ark tasks block <id> --reason <reason>",
+        deprecated_flags: ["--confidence", "--confidence-score"]
       },
       task_lifecycle: {
         order: ["hold","draft","queued","in_progress","blocked","review","done"],
@@ -3368,7 +3363,8 @@ TASKS
   ark tasks context-set <id>         Merge fields into context without replacing it (agent only)
     --set key=value  [--set key2=value2 ...]
   ark tasks status <id>              Transition status manually
-    --status=<status>  [--confidence=|--confidence-score=]  [--comment-id=]  [--run-id=]  [--json]
+    --status=<status>  [--comment-id=]  [--run-id=]  [--json]
+    --confidence / --confidence-score are deprecated no-ops (ignored, not sent)
     release hold with --status=draft
   ark tasks claim <id>               Transition queued → in_progress
   ark tasks claim-next               Atomically claim the next eligible queued task
@@ -3377,8 +3373,8 @@ TASKS
     [--page-size=100]  [--after-id=<uuid>]  [--snapshot-at=<iso-date-time>]  [--json]
   ark tasks ask-review <id>          Request human review without completing the task
     [--reason=<reason>]
-  ark tasks complete <id>            Transition to done (>=0.85) or review (<0.85)
-    --confidence=<0.0-1.0>
+  ark tasks complete <id>            Transition to done (human review is decided server-side)
+    --confidence is a deprecated no-op (ignored, not sent)
   ark tasks block <id>               Post blocker comment + transition → blocked
     --reason=<reason>
   ark tasks delete <id>              Delete a draft task (human only)
