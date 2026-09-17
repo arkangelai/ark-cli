@@ -167,6 +167,8 @@ test_literal_aliases_and_run_fencing() (
       */status) HTTP_STATUS=200; HTTP_BODY='{"ok":true,"data":{"id":"task-1","status":"done"}}' ;;
     esac
   }
+  # claim-next drives its own retry loop through http_request_once.
+  http_request_once() { http_request "$@"; }
 
   local output report="$TEST_DIR/report.json"
   output=$(main tasks claim-next --worker-id worker-literal --json)

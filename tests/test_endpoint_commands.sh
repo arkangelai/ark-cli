@@ -44,7 +44,7 @@ printf 'HTTP/1.1 200 OK\r\nX-Request-Id: request-123\r\n\r\n' > "$header_file"
 
 case "$url" in
   */api/tasks/claim-next*)
-    response='{"ok":true,"data":{"id":"task-1","status":"in_progress","task_type":"general"},"_links":{"complete":"/tasks/task-1/status"}}'
+    response='{"ok":true,"data":{"task":{"id":"task-1","status":"in_progress","task_type":"general"},"assignment":{"kind":"parent"}},"_links":{"complete":"/tasks/task-1/status"}}'
     ;;
   */api/tasks/task-1/ask-review)
     response='{"ok":true,"data":{"id":"task-1","status":"in_progress"},"_links":{}}'
@@ -91,12 +91,21 @@ assert_eq() {
   fi
 }
 
-output=$(ARK_IDEMPOTENCY_KEY="claim-key" run_cli tasks claim-next --task-type "audit soat")
-assert_eq "task-1" "$(printf '%s' "$output" | "$REAL_JQ" -r '.data.id')" "claim-next response"
+output=$(ARK_IDEMPOTENCY_KEY="claim-key" run_cli tasks claim-next --worker-id worker-1 --json)
+assert_eq "task-1" "$(printf '%s' "$output" | "$REAL_JQ" -r '.data.task.id')" "claim-next response"
 IFS='|' read -r method url body idem < "$CALL_FILE"
 assert_eq "POST" "$method" "claim-next method"
-assert_eq "https://api.example.test/api/tasks/claim-next?task_type=audit%20soat" "$url" "claim-next URL"
+assert_eq "https://api.example.test/api/tasks/claim-next" "$url" "claim-next URL"
 assert_eq "claim-key" "$idem" "claim-next idempotency key"
+
+rm -f "$CALL_FILE"
+set +e
+error_output=$(run_cli tasks claim-next --task-type "audit soat" 2>&1 >/dev/null)
+status=$?
+set -e
+assert_eq "2" "$status" "claim-next rejects --task-type"
+assert_eq "bad_argument" "$(printf '%s' "$error_output" | "$REAL_JQ" -r '.error.code')" "claim-next filter error code"
+assert_eq "false" "$([[ -f "$CALL_FILE" ]] && echo true || echo false)" "claim-next filter sends no request"
 
 output=$(ARK_IDEMPOTENCY_KEY="review-key" run_cli tasks ask-review task-1 --reason "Check coverage")
 IFS='|' read -r method url body idem < "$CALL_FILE"

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+body_file="" header_file="" method="" url="" idem_key="" worker_id="" request_body="absent"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) shift; body_file="$1" ;;
+    --dump-header) shift; header_file="$1" ;;
+    -X) shift; method="$1" ;;
+    -H)
+      shift
+      case "$1" in
+        Idempotency-Key:*) idem_key="${1#Idempotency-Key: }" ;;
+        X-Worker-Id:*) worker_id="${1#X-Worker-Id: }" ;;
+      esac
+      ;;
+    --data) shift; request_body="present" ;;
+    http://*|https://*) url="$1" ;;
+  esac
+  shift || true
+done
+
+: "${FAKE_CURL_LOG:?}"
+: "${FAKE_CURL_STATE:?}"
+: "${FAKE_CURL_SCENARIO:?}"
+
+printf '%s\t%s\t%s\t%s\t%s\n' "$method" "$url" "$idem_key" "$worker_id" "$request_body" >>"$FAKE_CURL_LOG"
+
+attempt=0
+if [[ -f "$FAKE_CURL_STATE" ]]; then
+  attempt=$(<"$FAKE_CURL_STATE")
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" >"$FAKE_CURL_STATE"
+
+status=200
+replay=false
+retry_after=""
+curl_exit=0
+body='{"ok":true,"data":{"task":{"id":"task-1","status":"in_progress","task_type":"general","context":{}},"assignment":{"kind":"parent","max_concurrency":4}}}'
+
+case "$FAKE_CURL_SCENARIO" in
+  task) ;;
+  empty) body='{"ok":true,"data":null}' ;;
+  replay) replay=true ;;
+  invalid) body='{"ok":true,"data":{"task":{"id":"task-1"}}}' ;;
+  401) status=401; body='{"ok":false,"error":{"code":"unauthenticated","message":"bad key","detail":{}}}' ;;
+  403) status=403; body='{"ok":false,"error":{"code":"forbidden","message":"bad profile","detail":{}}}' ;;
+  409) status=409; body='{"ok":false,"error":{"code":"status_conflict","message":"conflict","detail":{}}}' ;;
+  422) status=422; body='{"ok":false,"error":{"code":"validation_error","message":"bad profile","detail":{}}}' ;;
+  429-then-task)
+    if [[ "$attempt" -eq 1 ]]; then
+      status=429; retry_after=2
+      body='{"ok":false,"error":{"code":"rate_limited","message":"slow down","detail":{}}}'
+    fi
+    ;;
+  500-then-task)
+    if [[ "$attempt" -eq 1 ]]; then
+      status=500
+      body='{"ok":false,"error":{"code":"internal_error","message":"temporary","detail":{}}}'
+    fi
+    ;;
+  network-then-task)
+    if [[ "$attempt" -eq 1 ]]; then status=000; curl_exit=7; body=''; fi
+    ;;
+  always-network) status=000; curl_exit=28; body='' ;;
+  concurrent)
+    lock="${FAKE_CURL_STATE}.lock"
+    while ! mkdir "$lock" 2>/dev/null; do /bin/sleep 0.01; done
+    sequence_file="${FAKE_CURL_STATE}.sequence"
+    sequence=0
+    [[ -f "$sequence_file" ]] && sequence=$(<"$sequence_file")
+    sequence=$((sequence + 1))
+    printf '%s\n' "$sequence" >"$sequence_file"
+    rmdir "$lock"
+    body="{\"ok\":true,\"data\":{\"task\":{\"id\":\"task-${sequence}\",\"status\":\"in_progress\",\"task_type\":\"general\",\"context\":{}},\"assignment\":{\"kind\":\"parent\"}}}"
+    ;;
+  *) printf 'unknown fake curl scenario: %s\n' "$FAKE_CURL_SCENARIO" >&2; exit 99 ;;
+esac
+
+printf '%s' "$body" >"$body_file"
+{
+  printf 'HTTP/1.1 %s Fake\r\n' "$status"
+  printf 'X-Request-Id: request-%s\r\n' "$attempt"
+  printf 'X-Idempotent-Replay: %s\r\n' "$replay"
+  [[ -n "$retry_after" ]] && printf 'Retry-After: %s\r\n' "$retry_after"
+  printf '\r\n'
+} >"$header_file"
+printf '%s' "$status"
+exit "$curl_exit"

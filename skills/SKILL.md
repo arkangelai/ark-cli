@@ -6,7 +6,7 @@ description: >
   outputs, and completing the task. Also handles blockers,
   follow-on task creation, and re-execution after human feedback. Use when you
   are an agent that needs to pick up and execute tasks from the queue.
-version: "1.7"
+version: "1.8"
 compatibility: Requires ark CLI installed and configured with a valid api-key and url.
 ---
 
@@ -40,7 +40,7 @@ ark config set url <api-url>
 ark config set api-key <your-key>
 ```
 
-If `ark` is not installed, run `bash install.sh` from the tasks-ark-cli repository
+If `ark` is not installed, run `bash install.sh` from the arkangelai/ark-cli repository
 or copy the `ark` script to a directory in your `$PATH`.
 
 ### Keeping the skill current
@@ -111,20 +111,23 @@ discard local work. Never call `ask-review`, `review/decision`,
 
 ## Workflow 9 — Ejecutar una tarea batch-denial-mail
 
-Este workflow se aplica cuando `.data[0].task_type` es `batch-denial-mail`. El agente no razona sobre el contenido — solo ejecuta el script y reporta el resultado.
+Este workflow se aplica cuando `.data.task.task_type` es `batch-denial-mail`. El agente no razona sobre el contenido — solo ejecuta el script y reporta el resultado.
 
-### Paso 1: Tomar y detectar la tarea
+### Paso 1: Tomar atómicamente la siguiente tarea elegible
 
 ```bash
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-CLAIM=$(ark tasks claim-next --task-type batch-denial-mail)
-TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
+TASK_TYPE=$(printf '%s' "$CLAIM" | jq -r '.data.task.task_type // empty')
 ```
 
-Leer `.data.task_type`. Si es `batch-denial-mail`, seguir este workflow. Si no,
-usar Workflow 1. Verificar que `.data.status` sea `"in_progress"` antes de continuar.
+Si `TASK_ID` está vacío, no hay trabajo elegible. Si `TASK_TYPE` es
+`batch-denial-mail`, seguir este workflow; si no, usar Workflow 1. La tarea ya
+llega en `in_progress`. `claim-next` no acepta filtros de tipo: el perfil de la
+API key decide qué tareas son elegibles.
 
-### Paso 3: Ejecutar el script
+### Paso 2: Ejecutar el script
 
 ```bash
 ark audit send-denial-mail "$TASK_ID"
@@ -132,7 +135,7 @@ ark audit send-denial-mail "$TASK_ID"
 
 El script maneja internamente: consulta a la API, generación del Excel, envío del correo y cierre. El agente no interviene en ninguno de esos pasos.
 
-### Paso 4: Actualizar las tareas eps_audit individuales
+### Paso 3: Actualizar las tareas eps_audit individuales
 
 Si exit code `0`, antes de completar la tarea batch, actualizar cada tarea `eps_audit` referenciada en `context.task_ids`:
 
@@ -150,7 +153,7 @@ done
 
 Si el PATCH de alguna tarea individual falla, registrarlo como comentario `note` en la tarea batch y continuar — no bloquear el flujo completo por un fallo parcial.
 
-### Paso 5: Completar la tarea batch
+### Paso 4: Completar la tarea batch
 
 ```bash
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:complete"
@@ -190,12 +193,13 @@ TASK_RUN_ID=$(ark gen-uuid)
 Never reuse a `TASK_RUN_ID` across different execution runs. If a task is
 re-queued after review or a blocker, generate a fresh one.
 
-### Step 2: Atomically claim the next queued task
+### Step 2: Atomically claim the next eligible task
 
 ```bash
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
 CLAIM=$(ark tasks claim-next)
-TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.id // empty')
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
+[[ -n "$TASK_ID" ]] || exit 0
 ```
 
 This is one atomic operation. Never use `tasks list --limit 1` followed by
@@ -207,24 +211,24 @@ returns the complete status histogram in one request. A list response's
 task states merely to count them.
 
 Read from the response:
-- `.data.id` → store as `TASK_ID`. Required for all subsequent commands.
-- `.data.title` → what the task is.
-- `.data.description` → full human explanation of the goal.
-- `.data.context` → structured JSON instructions. This is your primary input.
-- missing or empty `.data.id` → no eligible work is available. Exit gracefully.
+- `.data.task.id` → store as `TASK_ID`. Required for all subsequent commands.
+- `.data.task.title` → what the task is.
+- `.data.task.description` → full human explanation of the goal.
+- `.data.task.context` → structured JSON instructions. This is your primary input.
+- `.data.assignment` → execution hints chosen by the API-key profile.
 
-If `TASK_ID` is empty:
+If `.data` is `null`, no eligible work is available. Exit with code `0`. A
+long-running dispatcher must wait its normal polling interval with jitter before
+generating a key for the next logical poll; never retry in a tight loop.
 
-```json
-{"ok": false, "error": "No queued tasks available"}
-```
-
-Exit with code `0`. Do not retry in a tight loop.
+`claim-next` accepts no local task type/kind filters (only `--worker-id` and
+`--json`). It sends a stable `X-Worker-Id`; configure `ARK_WORKER_ID` to the same
+identity used by heartbeat.
 
 ### Step 3: Validate the claim
 
 The claim response contains:
-- `.data.status` → must be `"in_progress"`. If not, something is wrong — stop and report.
+- `.data.task.status` → must be `"in_progress"`. If not, something is wrong — stop and report.
 - `.idempotent_replay` → if `true`, this claim was already made in a prior attempt. Continue normally.
 - `.next_commands` → the map of valid next operations. Read it. Follow it.
 
@@ -440,7 +444,16 @@ run — generate a fresh `TASK_RUN_ID`.
 TASK_RUN_ID=$(ark gen-uuid)
 ```
 
-### Step 1: Read the feedback
+### Step 1: Atomically reclaim queued work
+
+```bash
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
+[[ -n "$TASK_ID" ]] || exit 0
+```
+
+### Step 2: Read the feedback
 
 ```bash
 ark tasks comments list "$TASK_ID"
@@ -453,13 +466,6 @@ Find the last comment where:
 Read `.body` — this is what the human wants changed. If there are multiple
 `changes_requested` comments, read them all in chronological order to understand
 the full revision history.
-
-### Step 2: Re-claim the task
-
-```bash
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-ark tasks claim "$TASK_ID"
-```
 
 ### Step 3: Read inputs again
 
@@ -708,7 +714,7 @@ task with `ark tasks status <id> --status draft`; agents should only claim
 
 | From | To | Command |
 |---|---|---|
-| `queued` | `in_progress` | `ark tasks claim <id>` |
+| `queued` | `in_progress` | `ark tasks claim-next` (atomic selection + transition) |
 | `in_progress` | `done` | `ark tasks complete <id>` |
 | `in_progress` | `blocked` | `ark tasks block <id> --reason "..."` |
 
@@ -761,7 +767,7 @@ valid for the current state and actor. Read it. It is the contract. Do not assum
 a status sequence based on what you think should come next.
 
 **Idempotency keys must be unique per action and per run.**
-`${TASK_RUN_ID}:claim` is valid for retrying the same claim in the same run.
+`${TASK_RUN_ID}:claim-next` is valid for retrying the same logical poll in the same run.
 It is not valid in a different run. A re-queued task is a new run — generate a
 fresh `TASK_RUN_ID`. Reusing keys across runs causes the API to return a cached
 response from the old run.
@@ -777,7 +783,7 @@ into separate comment + status calls.
 
 **The `context` field is your instruction set.**
 `tasks.context` is a JSON object the human wrote. It is not metadata — it is
-your primary task instructions. Always read it from the initial `tasks list`
+your primary task instructions. Always read it from the initial `tasks claim-next`
 response. Parse it as JSON and use its fields to guide your execution.
 A human can update it at any time via `ark tasks context <id> --data '<json>'`
 or clear it with `--clear`. If context changes while you are running, you will
@@ -830,6 +836,22 @@ actually attach the file contents. Both are valid, and both show up in
 ---
 
 ## Error Handling
+
+### Atomic claim errors
+
+`ark tasks claim-next` manages transient retries inside one logical poll and
+keeps its idempotency key unchanged:
+
+- `200` with `data.task` + `data.assignment`: execute the task.
+- `200` with `data=null`: no eligible work; wait the normal poll interval with
+  jitter before creating a new poll key.
+- `401`, `403`, `409`, `422`: permanent/semantic for this poll; stop claims and
+  require credential/profile/state correction. Never loop immediately.
+- `429`: honor `Retry-After` and reuse the same key.
+- `5xx`, timeout, network: bounded exponential backoff with jitter and the same
+  key (`ARK_CLAIM_MAX_RETRIES`, default 3). If retries are exhausted, open the
+  claim circuit; do not start another logical poll after an ambiguous network
+  result.
 
 ### Transient errors (network, rate limit)
 
@@ -899,12 +921,14 @@ A successful task execution produces all of the following:
 # Setup
 TASK_RUN_ID=$(ark gen-uuid)
 
-# Atomically find and claim work
-export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim"
-TASK_JSON=$(ark tasks claim-next)
-TASK_ID=$(echo "$TASK_JSON" | jq -r '.data.id // empty')
-CONTEXT=$(echo "$TASK_JSON" | jq -c '.data.context')
+# Atomically claim work
+export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:claim-next"
+CLAIM=$(ark tasks claim-next)
+TASK_ID=$(printf '%s' "$CLAIM" | jq -r '.data.task.id // empty')
+CONTEXT=$(printf '%s' "$CLAIM" | jq -c '.data.task.context // {}')
+ASSIGNMENT=$(printf '%s' "$CLAIM" | jq -c '.data.assignment // {}')
 # e.g. CONTEXT = {"analyze": "sales data", "output_format": "summary_json"}
+[[ -n "$TASK_ID" ]] || exit 0
 
 # Set workspace
 export ARK_IDEMPOTENCY_KEY="${TASK_RUN_ID}:workspace"
@@ -954,7 +978,6 @@ ark tasks complete "$TASK_ID"
 
 ```
 ark tasks stats                               Count all tasks by status in one request
-ark tasks list --status queued --limit 1      Find available work
 ark tasks list --status blocked --since <iso> --sort created_at --order asc --brief
                                               Scan oldest blockers with a small payload
 ark tasks find "<business identifier>"        Find an existing task
@@ -962,8 +985,7 @@ ark tasks list --factura-key "FE 57100"       Filter by exact business column
 ark tasks list --task-type audit_soat          Filter by task workflow kind
 ark tasks list --created-by-type agent         Filter by creator kind
 ark tasks list --parent "$PARENT_TASK_ID"      Filter child tasks by parent
-ark tasks claim-next                          Atomically claim available work
-ark tasks claim <id>                          Re-claim a known re-queued task
+ark tasks claim-next                          Atomically select + claim work
 ark tasks ask-review <id> [--reason=]         Request review without completing
 ark tasks update <id> --log-path <path>       Declare workspace
 ark tasks inputs list <id>                    What to read
